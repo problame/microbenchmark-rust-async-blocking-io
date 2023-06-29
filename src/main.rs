@@ -2,7 +2,10 @@ use std::{
     alloc::Layout,
     io::Write,
     num::NonZeroU64,
-    os::unix::prelude::{FileExt, OpenOptionsExt},
+    os::{
+        fd::{AsFd, FromRawFd, IntoRawFd},
+        unix::prelude::{FileExt, OpenOptionsExt},
+    },
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,33 +13,40 @@ use std::{
     },
 };
 
+use clap::Parser;
 use rand::{Rng, RngCore};
-use structopt::StructOpt;
 use tracing::{info, trace};
 
-#[derive(structopt::StructOpt)]
+#[derive(clap::Parser)]
 struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
+    engine: EngineKind,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum EngineKind {
     Std,
-}
-
-enum Engine {
-    Std(EngineStd),
+    TokioSpawnBlocking,
 }
 
 struct EngineStd {}
+
+struct EngineTokioSpawnBlocking {
+    rt: tokio::runtime::Runtime,
+}
+
+trait Engine {
+    fn run(&self, args: &'static Args, stop: Arc<AtomicBool>, reads_in_last_second: Arc<AtomicU64>);
+}
 
 fn main() {
     std::env::set_var("RUST_LOG", "info");
 
     tracing_subscriber::fmt::init();
 
-    let args: &'static Args = Box::leak(Box::new(Args::from_args()));
+    let args: &'static Args = Box::leak(Box::new(Args::parse()));
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -44,47 +54,7 @@ fn main() {
 
     let engine = Arc::new(setup_engine(&args));
 
-    let mut clients = Vec::new();
-
     let reads_in_last_second = Arc::new(AtomicU64::new(0));
-
-    for i in 0..args.num_clients.get() {
-        let stop = Arc::clone(&stop);
-        let engine = Arc::clone(&engine);
-        let reads_in_last_second = Arc::clone(&reads_in_last_second);
-        let jh = std::thread::spawn(move || {
-            tracing::info!("Client {i} starting");
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(data_file_path(args, i))
-                .unwrap();
-            let block_size = 1 << args.block_size_shift.get();
-            // alloc aligned to make O_DIRECT work
-            let buf = unsafe {
-                std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap())
-            };
-            assert!(!buf.is_null());
-            let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf, block_size) };
-            let block_size: u64 = block_size.try_into().unwrap();
-            while !stop.load(Ordering::Relaxed) {
-                // find a random aligned 8k offset inside the file
-                debug_assert!(1024 * 1024 % block_size == 0);
-                let offset_in_file = rand::thread_rng()
-                    .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size))
-                    * block_size;
-                // call the engine to make the io
-                match &*engine {
-                    Engine::Std(engine) => {
-                        engine.read_iter(i, args, &mut file, offset_in_file, buf)
-                    }
-                }
-                reads_in_last_second.fetch_add(1, Ordering::Relaxed);
-            }
-            info!("Client {i} stopping");
-        });
-        clients.push(jh);
-    }
 
     ctrlc::set_handler({
         let stop = Arc::clone(&stop);
@@ -93,22 +63,24 @@ fn main() {
         }
     });
 
-    std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let reads_in_last_second = reads_in_last_second.swap(0, Ordering::Relaxed);
-            info!(
-                "IOPS {}k BANDWIDTH {} MiB/s",
-                reads_in_last_second,
-                (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
-            );
+    let monitor = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        let reads_in_last_second = Arc::clone(&reads_in_last_second);
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let reads_in_last_second = reads_in_last_second.swap(0, Ordering::Relaxed);
+                info!(
+                    "IOPS {}k BANDWIDTH {} MiB/s",
+                    reads_in_last_second,
+                    (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
+                );
+            }
         }
-    })
-    .join();
+    });
 
-    for jh in clients {
-        jh.join().unwrap();
-    }
+    engine.run(&args, stop, reads_in_last_second);
+    monitor.join().unwrap();
 }
 
 fn data_dir(args: &Args) -> PathBuf {
@@ -151,11 +123,62 @@ fn setup_files(args: &Args) {
     }
 }
 
-fn setup_engine(args: &Args) -> Engine {
-    Engine::Std(EngineStd {})
+fn setup_engine(args: &Args) -> Arc<dyn Engine> {
+    match args.engine {
+        EngineKind::Std => Arc::new(EngineStd {}),
+        EngineKind::TokioSpawnBlocking => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            Arc::new(EngineTokioSpawnBlocking { rt })
+        }
+    }
 }
 
+impl Engine for EngineStd {
+    fn run(
+        &self,
+        args: &'static Args,
+        stop: Arc<AtomicBool>,
+        reads_in_last_second: Arc<AtomicU64>,
+    ) {
+        std::thread::scope(|scope| {
+            for i in 0..args.num_clients.get() {
+                let stop = Arc::clone(&stop);
+                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                scope.spawn(move || self.client(i, &args, &stop, &reads_in_last_second));
+            }
+        });
+    }
+}
 impl EngineStd {
+    fn client(&self, i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
+        tracing::info!("Client {i} starting");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(data_file_path(args, i))
+            .unwrap();
+        let block_size = 1 << args.block_size_shift.get();
+        // alloc aligned to make O_DIRECT work
+        let buf =
+            unsafe { std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap()) };
+        assert!(!buf.is_null());
+        let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf, block_size) };
+        let block_size: u64 = block_size.try_into().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            // find a random aligned 8k offset inside the file
+            debug_assert!(1024 * 1024 % block_size == 0);
+            let offset_in_file = rand::thread_rng()
+                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size))
+                * block_size;
+            self.read_iter(i, args, &mut file, offset_in_file, buf);
+            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+        }
+        info!("Client {i} stopping");
+    }
+
     #[inline(always)]
     fn read_iter(
         &self,
@@ -168,5 +191,76 @@ impl EngineStd {
         debug_assert_eq!(buf.len(), args.block_size_shift.get() as usize);
         file.read_at(buf, offset).unwrap();
         // TODO: verify
+    }
+}
+
+impl Engine for EngineTokioSpawnBlocking {
+    fn run(
+        &self,
+        args: &'static Args,
+        stop: Arc<AtomicBool>,
+        reads_in_last_second: Arc<AtomicU64>,
+    ) {
+        let rt = &self.rt;
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            for i in 0..args.num_clients.get() {
+                let stop = Arc::clone(&stop);
+                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                handles.push(tokio::spawn(async move {
+                    Self::client(i, &args, &stop, &reads_in_last_second).await
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+    }
+}
+
+impl EngineTokioSpawnBlocking {
+    async fn client(i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
+        tracing::info!("Client {i} starting");
+        let block_size = 1 << args.block_size_shift.get();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(data_file_path(args, i))
+            .unwrap();
+        let file_fd = file.into_raw_fd();
+
+        // alloc aligned to make O_DIRECT work
+        let buf = {
+            let buf_ptr = unsafe {
+                std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap())
+            };
+            assert!(!buf_ptr.is_null());
+            #[derive(Clone, Copy)]
+            struct SendPtr(*mut u8);
+            unsafe impl Send for SendPtr {} // the thread spawned in the loop below doesn't outlive this function (we're polled t completion)
+            unsafe impl Sync for SendPtr {} // the loop below ensures only one thread accesses it at a time
+            let buf = SendPtr(buf_ptr);
+            // extra scope so that it doesn't outlive any await points, it's not Send, only the SendPtr wrapper is
+            buf
+        };
+        let block_size_u64: u64 = block_size.try_into().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            // find a random aligned 8k offset inside the file
+            debug_assert!(1024 * 1024 % block_size == 0);
+            let offset_in_file = rand::thread_rng()
+                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                * block_size_u64;
+            tokio::task::spawn_blocking(move || {
+                let buf = buf;
+                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
+                let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+                file.read_at(buf, offset_in_file).unwrap();
+                file.into_raw_fd(); // so that it's there for next iteration
+            })
+            .await
+            .unwrap();
+            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+        }
+        info!("Client {i} stopping");
     }
 }
