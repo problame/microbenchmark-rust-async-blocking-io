@@ -115,7 +115,7 @@ fn setup_files(args: &Args) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
         }
-        let mut file = std::fs::File::create(&file_path).unwrap();
+        let mut file = open_file_direct_io(&file_path, IoMode::WriteCreateNewTruncate);
         // fill the file with pseudo-random data, in 1 MiB chunks.
         for _ in 0..args.file_size_mib.get() {
             let mut chunk = [0u8; 1024 * 1024];
@@ -154,12 +154,23 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
     }
 }
 
-fn open_file_direct_io(path: &Path) -> std::fs::File {
+enum IoMode {
+    Read,
+    WriteCreateNewTruncate,
+}
+
+fn open_file_direct_io(path: &Path, io_mode: IoMode) -> std::fs::File {
+    let (read, write, create_new_truncate) = match io_mode {
+        IoMode::Read => (true, false, false),
+        IoMode::WriteCreateNewTruncate => (false, true, true),
+    };
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::prelude::OpenOptionsExt;
         std::fs::OpenOptions::new()
-            .read(true)
+            .read(read)
+            .write(write)
+            .create_new(create_new_truncate)
             .custom_flags(libc::O_DIRECT)
             .open(path)
             .unwrap()
@@ -173,7 +184,12 @@ fn open_file_direct_io(path: &Path) -> std::fs::File {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(read)
+            .write(write)
+            .create_new(create_new_truncate)
+            .open(path)
+            .unwrap();
         let fd = file.as_raw_fd();
         let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
         assert_eq!(res, 0);
@@ -201,7 +217,7 @@ impl Engine for EngineStd {
 impl EngineStd {
     fn client(&self, i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
         tracing::info!("Client {i} starting");
-        let mut file = open_file_direct_io(&data_file_path(args, i));
+        let mut file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
         let block_size = 1 << args.block_size_shift.get();
         // alloc aligned to make O_DIRECT work
         let buf =
@@ -265,7 +281,7 @@ impl EngineTokioSpawnBlocking {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(&data_file_path(args, i));
+        let file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
@@ -368,7 +384,7 @@ impl EngineTokioFlume {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(&data_file_path(args, i));
+        let file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
