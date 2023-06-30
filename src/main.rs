@@ -1,9 +1,10 @@
+use std::os::fd::AsFd;
 use std::{
     alloc::Layout,
     io::Write,
     num::NonZeroU64,
     os::{
-        fd::{AsFd, FromRawFd, IntoRawFd},
+        fd::{FromRawFd, IntoRawFd},
         unix::prelude::{FileExt, OpenOptionsExt},
     },
     path::PathBuf,
@@ -15,20 +16,22 @@ use std::{
 
 use clap::Parser;
 use rand::{Rng, RngCore};
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 
 #[derive(clap::Parser)]
 struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
+    #[clap(subcommand)]
     engine: EngineKind,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::Subcommand)]
 enum EngineKind {
     Std,
     TokioSpawnBlocking,
+    TokioFlume { workers: NonZeroU64 },
 }
 
 struct EngineStd {}
@@ -38,7 +41,12 @@ struct EngineTokioSpawnBlocking {
 }
 
 trait Engine {
-    fn run(&self, args: &'static Args, stop: Arc<AtomicBool>, reads_in_last_second: Arc<AtomicU64>);
+    fn run(
+        self: Arc<Self>,
+        args: &'static Args,
+        stop: Arc<AtomicBool>,
+        reads_in_last_second: Arc<AtomicU64>,
+    );
 }
 
 fn main() {
@@ -52,7 +60,7 @@ fn main() {
 
     setup_files(&args);
 
-    let engine = Arc::new(setup_engine(&args));
+    let engine = setup_engine(&args);
 
     let reads_in_last_second = Arc::new(AtomicU64::new(0));
 
@@ -133,12 +141,22 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
                 .unwrap();
             Arc::new(EngineTokioSpawnBlocking { rt })
         }
+        EngineKind::TokioFlume { workers } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            Arc::new(EngineTokioFlume {
+                rt,
+                num_workers: workers,
+            })
+        }
     }
 }
 
 impl Engine for EngineStd {
     fn run(
-        &self,
+        self: Arc<Self>,
         args: &'static Args,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
@@ -147,7 +165,8 @@ impl Engine for EngineStd {
             for i in 0..args.num_clients.get() {
                 let stop = Arc::clone(&stop);
                 let reads_in_last_second = Arc::clone(&reads_in_last_second);
-                scope.spawn(move || self.client(i, &args, &stop, &reads_in_last_second));
+                let myself = Arc::clone(&self);
+                scope.spawn(move || myself.client(i, &args, &stop, &reads_in_last_second));
             }
         });
     }
@@ -196,7 +215,7 @@ impl EngineStd {
 
 impl Engine for EngineTokioSpawnBlocking {
     fn run(
-        &self,
+        self: Arc<Self>,
         args: &'static Args,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
@@ -262,5 +281,142 @@ impl EngineTokioSpawnBlocking {
             reads_in_last_second.fetch_add(1, Ordering::Relaxed);
         }
         info!("Client {i} stopping");
+    }
+}
+
+struct EngineTokioFlume {
+    rt: tokio::runtime::Runtime,
+    num_workers: NonZeroU64,
+}
+
+impl Engine for EngineTokioFlume {
+    fn run(
+        self: Arc<Self>,
+        args: &'static Args,
+        stop: Arc<AtomicBool>,
+        reads_in_last_second: Arc<AtomicU64>,
+    ) {
+        let (worker_tx, work_rx) = flume::bounded(0);
+        let mut handles = Vec::new();
+        for _ in 0..self.num_workers.get() {
+            let work_rx = work_rx.clone();
+            let stop = Arc::clone(&stop);
+            let reads_in_last_second = Arc::clone(&reads_in_last_second);
+            let handle = std::thread::spawn(move || Self::worker(work_rx));
+            handles.push(handle);
+        }
+        // workers get stopped by the worker_tx being dropped
+        scopeguard::defer!(for handle in handles {
+            handle.join().unwrap();
+        });
+        let rt = &self.rt;
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            for i in 0..args.num_clients.get() {
+                let stop = Arc::clone(&stop);
+                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                let worker_tx = worker_tx.clone();
+                let myself = Arc::clone(&self);
+                handles.push(tokio::spawn(async move {
+                    myself
+                        .client(worker_tx, i, &args, &stop, &reads_in_last_second)
+                        .await
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+        drop(worker_tx); // stops the workers
+    }
+}
+
+type FlumeWork = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'static>;
+
+struct FlumeWorkRequest {
+    work: FlumeWork,
+    response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+}
+
+impl EngineTokioFlume {
+    async fn client(
+        &self,
+        worker_tx: flume::Sender<FlumeWorkRequest>,
+        i: u64,
+        args: &Args,
+        stop: &AtomicBool,
+        reads_in_last_second: &AtomicU64,
+    ) {
+        tracing::info!("Client {i} starting");
+        let block_size = 1 << args.block_size_shift.get();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(data_file_path(args, i))
+            .unwrap();
+        let file_fd = file.into_raw_fd();
+
+        // alloc aligned to make O_DIRECT work
+        let buf = {
+            let buf_ptr = unsafe {
+                std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap())
+            };
+            assert!(!buf_ptr.is_null());
+            #[derive(Clone, Copy)]
+            struct SendPtr(*mut u8);
+            unsafe impl Send for SendPtr {} // the thread spawned in the loop below doesn't outlive this function (we're polled t completion)
+            unsafe impl Sync for SendPtr {} // the loop below ensures only one thread accesses it at a time
+            let buf = SendPtr(buf_ptr);
+            // extra scope so that it doesn't outlive any await points, it's not Send, only the SendPtr wrapper is
+            buf
+        };
+        let block_size_u64: u64 = block_size.try_into().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            // find a random aligned 8k offset inside the file
+            debug_assert!(1024 * 1024 % block_size == 0);
+            let offset_in_file = rand::thread_rng()
+                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                * block_size_u64;
+            let work = Box::new(move || {
+                let buf = buf;
+                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
+                let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+                file.read_at(buf, offset_in_file).unwrap();
+                file.into_raw_fd(); // so that it's there for next iteration
+                Ok(())
+            });
+            // TODO: can this dealock with rendezvous channel?
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            worker_tx
+                .send_async(FlumeWorkRequest {
+                    work,
+                    response: response_tx,
+                })
+                .await;
+            response_rx
+                .await
+                .expect("rx flume")
+                .expect("not expecting io errors");
+            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+        }
+        info!("Client {i} stopping");
+    }
+    fn worker(rx: flume::Receiver<FlumeWorkRequest>) {
+        loop {
+            let FlumeWorkRequest { work, response } = match rx.recv() {
+                Ok(w) => w,
+                Err(flume::RecvError::Disconnected) => {
+                    info!("Worker stopping");
+                    return;
+                }
+            };
+            let res = work();
+            match response.send(res) {
+                Ok(()) => (),
+                Err(x) => {
+                    error!("Failed to send response: {:?}", x);
+                }
+            }
+        }
     }
 }
