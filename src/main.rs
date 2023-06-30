@@ -98,6 +98,12 @@ fn data_file_path(_args: &Args, client_num: u64) -> PathBuf {
     std::path::PathBuf::from("data").join(format!("client_{}.data", client_num))
 }
 
+fn alloc_self_aligned_buffer(size: usize) -> *mut u8 {
+    let buf_ptr = unsafe { std::alloc::alloc(Layout::from_size_align(size, size).unwrap()) };
+    assert!(!buf_ptr.is_null());
+    buf_ptr
+}
+
 fn setup_files(args: &Args) {
     let data_dir = data_dir(args);
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -116,10 +122,12 @@ fn setup_files(args: &Args) {
             Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
         }
         let mut file = open_file_direct_io(&file_path, IoMode::WriteCreateNewTruncate);
+
         // fill the file with pseudo-random data
-        let mut chunk = [0u8; 1 << args.block_size_shift];
+        let chunk = alloc_self_aligned_buffer(1 << 20);
+        let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
         for _ in 0..args.file_size_mib.get() {
-            rand::thread_rng().fill_bytes(&mut chunk);
+            rand::thread_rng().fill_bytes(chunk);
             file.write_all(&chunk).unwrap();
         }
     }
