@@ -1,4 +1,3 @@
-use std::os::fd::AsFd;
 use std::{
     alloc::Layout,
     io::Write,
@@ -16,7 +15,7 @@ use std::{
 
 use clap::Parser;
 use rand::{Rng, RngCore};
-use tracing::{error, info, trace};
+use tracing::{error, info};
 
 #[derive(clap::Parser)]
 struct Args {
@@ -69,7 +68,8 @@ fn main() {
         move || {
             stop.store(true, Ordering::Relaxed);
         }
-    });
+    })
+    .unwrap();
 
     let monitor = std::thread::spawn({
         let stop = Arc::clone(&stop);
@@ -91,10 +91,10 @@ fn main() {
     monitor.join().unwrap();
 }
 
-fn data_dir(args: &Args) -> PathBuf {
+fn data_dir(_args: &Args) -> PathBuf {
     std::path::PathBuf::from("data")
 }
-fn data_file_path(args: &Args, client_num: u64) -> PathBuf {
+fn data_file_path(_args: &Args, client_num: u64) -> PathBuf {
     std::path::PathBuf::from("data").join(format!("client_{}.data", client_num))
 }
 
@@ -201,7 +201,7 @@ impl EngineStd {
     #[inline(always)]
     fn read_iter(
         &self,
-        client_num: u64,
+        _client_num: u64,
         args: &Args,
         file: &mut std::fs::File,
         offset: u64,
@@ -241,7 +241,7 @@ impl EngineTokioSpawnBlocking {
     async fn client(i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(data_file_path(args, i))
@@ -300,8 +300,6 @@ impl Engine for EngineTokioFlume {
         let mut handles = Vec::new();
         for _ in 0..self.num_workers.get() {
             let work_rx = work_rx.clone();
-            let stop = Arc::clone(&stop);
-            let reads_in_last_second = Arc::clone(&reads_in_last_second);
             let handle = std::thread::spawn(move || Self::worker(work_rx));
             handles.push(handle);
         }
@@ -349,7 +347,7 @@ impl EngineTokioFlume {
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(data_file_path(args, i))
@@ -392,7 +390,8 @@ impl EngineTokioFlume {
                     work,
                     response: response_tx,
                 })
-                .await;
+                .await
+                .unwrap();
             response_rx
                 .await
                 .expect("rx flume")
