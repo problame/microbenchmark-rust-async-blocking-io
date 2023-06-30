@@ -116,9 +116,9 @@ fn setup_files(args: &Args) {
             Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
         }
         let mut file = open_file_direct_io(&file_path, IoMode::WriteCreateNewTruncate);
-        // fill the file with pseudo-random data, in 1 MiB chunks.
+        // fill the file with pseudo-random data
+        let mut chunk = [0u8; 1 << args.block_size_shift];
         for _ in 0..args.file_size_mib.get() {
-            let mut chunk = [0u8; 1024 * 1024];
             rand::thread_rng().fill_bytes(&mut chunk);
             file.write_all(&chunk).unwrap();
         }
