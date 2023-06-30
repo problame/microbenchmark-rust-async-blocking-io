@@ -4,9 +4,9 @@ use std::{
     num::NonZeroU64,
     os::{
         fd::{FromRawFd, IntoRawFd},
-        unix::prelude::{FileExt, OpenOptionsExt},
+        unix::prelude::FileExt,
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -154,6 +154,33 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
     }
 }
 
+fn open_file_direct_io(path: &Path) -> std::fs::File {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::prelude::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .unwrap()
+    }
+
+    // https://github.com/axboe/fio/issues/48
+    // summarized in https://github.com/ronomon/direct-io/issues/1#issuecomment-360331547
+    // => macOS does not support O_DIRECT, but we can use fcntl to set F_NOCACHE
+    // If the file pages are in the page cache, this has no effect though.
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+        let fd = file.as_raw_fd();
+        let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+        assert_eq!(res, 0);
+        file
+    }
+}
+
 impl Engine for EngineStd {
     fn run(
         self: Arc<Self>,
@@ -174,11 +201,7 @@ impl Engine for EngineStd {
 impl EngineStd {
     fn client(&self, i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
         tracing::info!("Client {i} starting");
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(data_file_path(args, i))
-            .unwrap();
+        let mut file = open_file_direct_io(&data_file_path(args, i));
         let block_size = 1 << args.block_size_shift.get();
         // alloc aligned to make O_DIRECT work
         let buf =
@@ -241,11 +264,8 @@ impl EngineTokioSpawnBlocking {
     async fn client(i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(data_file_path(args, i))
-            .unwrap();
+
+        let file = open_file_direct_io(&data_file_path(args, i));
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
@@ -347,11 +367,8 @@ impl EngineTokioFlume {
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(data_file_path(args, i))
-            .unwrap();
+
+        let file = open_file_direct_io(&data_file_path(args, i));
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
