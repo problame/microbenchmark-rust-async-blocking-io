@@ -22,8 +22,15 @@ struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
+    direct_io: DirectIoMode,
     #[clap(subcommand)]
     engine: EngineKind,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DirectIoMode {
+    DirectIo,
+    CachedIo,
 }
 
 #[derive(Clone, Copy, clap::Subcommand)]
@@ -126,7 +133,7 @@ fn setup_files(args: &Args) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
         }
-        let mut file = open_file_direct_io(&file_path, IoMode::WriteCreateNewTruncate);
+        let mut file = open_file_direct_io(args, OpenFileMode::WriteCreateNewTruncate, &file_path);
 
         // fill the file with pseudo-random data
         let chunk = alloc_self_aligned_buffer(1 << 20);
@@ -174,26 +181,31 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
     }
 }
 
-enum IoMode {
+enum OpenFileMode {
     Read,
     WriteCreateNewTruncate,
 }
 
-fn open_file_direct_io(path: &Path, io_mode: IoMode) -> std::fs::File {
-    let (read, write, create_new_truncate) = match io_mode {
-        IoMode::Read => (true, false, false),
-        IoMode::WriteCreateNewTruncate => (false, true, true),
+fn open_file_direct_io(args: &Args, mode: OpenFileMode, path: &Path) -> std::fs::File {
+    let (read, write, create_new_truncate) = match mode {
+        OpenFileMode::Read => (true, false, false),
+        OpenFileMode::WriteCreateNewTruncate => (false, true, true),
     };
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::prelude::OpenOptionsExt;
-        std::fs::OpenOptions::new()
+        let mut options = std::fs::OpenOptions::new();
+        options
             .read(read)
             .write(write)
-            .create_new(create_new_truncate)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)
-            .unwrap()
+            .create_new(create_new_truncate);
+        match args.direct_io {
+            DirectIoMode::DirectIo => {
+                options.custom_flags(libc::O_DIRECT);
+            }
+            DirectIoMode::CachedIo => {}
+        }
+        options.open(path).unwrap()
     }
 
     // https://github.com/axboe/fio/issues/48
@@ -210,9 +222,14 @@ fn open_file_direct_io(path: &Path, io_mode: IoMode) -> std::fs::File {
             .create_new(create_new_truncate)
             .open(path)
             .unwrap();
-        let fd = file.as_raw_fd();
-        let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
-        assert_eq!(res, 0);
+        match args.direct_io {
+            DirectIoMode::DirectIo => {
+                let fd = file.as_raw_fd();
+                let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+                assert_eq!(res, 0);
+            }
+            DirectIoMode::CachedIo => {}
+        }
         file
     }
 }
@@ -237,7 +254,7 @@ impl Engine for EngineStd {
 impl EngineStd {
     fn client(&self, i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
         tracing::info!("Client {i} starting");
-        let mut file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
+        let mut file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
         let block_size = 1 << args.block_size_shift.get();
         // alloc aligned to make O_DIRECT work
         let buf =
@@ -301,7 +318,7 @@ impl EngineTokioSpawnBlocking {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
+        let file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
@@ -405,7 +422,7 @@ impl EngineTokioFlume {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(&data_file_path(args, i), IoMode::Read);
+        let file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
         let file_fd = file.into_raw_fd();
 
         // alloc aligned to make O_DIRECT work
