@@ -29,8 +29,13 @@ struct Args {
 #[derive(Clone, Copy, clap::Subcommand)]
 enum EngineKind {
     Std,
-    TokioSpawnBlocking,
-    TokioFlume { workers: NonZeroU64 },
+    TokioSpawnBlocking {
+        spawn_blocking_pool_size: NonZeroU64,
+    },
+    TokioFlume {
+        workers: NonZeroU64,
+        queue_depth: NonZeroU64,
+    },
 }
 
 struct EngineStd {}
@@ -79,7 +84,7 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let reads_in_last_second = reads_in_last_second.swap(0, Ordering::Relaxed);
                 info!(
-                    "IOPS {}k BANDWIDTH {} MiB/s",
+                    "IOPS {} BANDWIDTH {} MiB/s",
                     reads_in_last_second,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                 );
@@ -142,14 +147,20 @@ fn setup_files(args: &Args) {
 fn setup_engine(args: &Args) -> Arc<dyn Engine> {
     match args.engine {
         EngineKind::Std => Arc::new(EngineStd {}),
-        EngineKind::TokioSpawnBlocking => {
+        EngineKind::TokioSpawnBlocking {
+            spawn_blocking_pool_size,
+        } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
+                .max_blocking_threads(spawn_blocking_pool_size.get() as usize)
                 .build()
                 .unwrap();
             Arc::new(EngineTokioSpawnBlocking { rt })
         }
-        EngineKind::TokioFlume { workers } => {
+        EngineKind::TokioFlume {
+            workers,
+            queue_depth,
+        } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -157,6 +168,7 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
             Arc::new(EngineTokioFlume {
                 rt,
                 num_workers: workers,
+                queue_depth,
             })
         }
     }
@@ -331,6 +343,7 @@ impl EngineTokioSpawnBlocking {
 struct EngineTokioFlume {
     rt: tokio::runtime::Runtime,
     num_workers: NonZeroU64,
+    queue_depth: NonZeroU64,
 }
 
 impl Engine for EngineTokioFlume {
@@ -340,7 +353,7 @@ impl Engine for EngineTokioFlume {
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
     ) {
-        let (worker_tx, work_rx) = flume::bounded(0);
+        let (worker_tx, work_rx) = flume::bounded(self.queue_depth.get() as usize);
         let mut handles = Vec::new();
         for _ in 0..self.num_workers.get() {
             let work_rx = work_rx.clone();
@@ -424,7 +437,7 @@ impl EngineTokioFlume {
                 file.into_raw_fd(); // so that it's there for next iteration
                 Ok(())
             });
-            // TODO: can this dealock with rendezvous channel?
+            // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             worker_tx
                 .send_async(FlumeWorkRequest {
