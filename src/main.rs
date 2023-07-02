@@ -1,6 +1,6 @@
 use std::{
     alloc::Layout,
-    io::Write,
+    io::{Seek, Write},
     num::NonZeroU64,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
@@ -203,29 +203,37 @@ fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     std::thread::scope(|scope| {
         for i in 0..args.num_clients.get() {
             let file_path = data_file_path(args, i);
-            match std::fs::metadata(&file_path) {
+            let (append_offset, append_megs) = match std::fs::metadata(&file_path) {
                 Ok(md) => {
                     if md.len() >= args.file_size_mib.get() * 1024 * 1024 {
-                        continue;
+                        (0, 0)
                     } else {
                         info!("File {:?} exists but has wrong size", file_path);
-                        std::fs::remove_file(&file_path).unwrap();
+                        let rounded_down_megs = md.len() / (1024 * 1024);
+                        let rounded_down_offset = rounded_down_megs * 1024 * 1024;
+                        let append_megs = args
+                            .file_size_mib
+                            .get()
+                            .checked_sub(rounded_down_megs)
+                            .unwrap();
+                        (rounded_down_offset, append_megs)
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, args.file_size_mib.get()),
                 Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
+            };
+            if append_megs == 0 {
+                continue;
             }
-            let mut file = open_file_direct_io(
-                disk_access_kind,
-                OpenFileMode::WriteCreateNewTruncate,
-                &file_path,
-            );
+            let mut file =
+                open_file_direct_io(disk_access_kind, OpenFileMode::WriteNoTruncate, &file_path);
+            file.seek(std::io::SeekFrom::Start(append_offset)).unwrap();
 
             // fill the file with pseudo-random data
             scope.spawn(move || {
                 let chunk = alloc_self_aligned_buffer(1 << 20);
                 let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
-                for _ in 0..args.file_size_mib.get() {
+                for _ in 0..append_megs {
                     rand::thread_rng().fill_bytes(chunk);
                     file.write_all(&chunk).unwrap();
                 }
@@ -266,7 +274,7 @@ fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
 
 enum OpenFileMode {
     Read,
-    WriteCreateNewTruncate,
+    WriteNoTruncate,
 }
 
 fn open_file_direct_io(
@@ -274,18 +282,15 @@ fn open_file_direct_io(
     mode: OpenFileMode,
     path: &Path,
 ) -> std::fs::File {
-    let (read, write, create_new_truncate) = match mode {
-        OpenFileMode::Read => (true, false, false),
-        OpenFileMode::WriteCreateNewTruncate => (false, true, true),
+    let (read, write) = match mode {
+        OpenFileMode::Read => (true, false),
+        OpenFileMode::WriteNoTruncate => (false, true),
     };
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::prelude::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
-        options
-            .read(read)
-            .write(write)
-            .create_new(create_new_truncate);
+        options.read(read).write(write).create(write);
         match disk_access_kind {
             DiskAccessKind::DirectIo { engine: _ } => {
                 options.custom_flags(libc::O_DIRECT);
@@ -306,7 +311,7 @@ fn open_file_direct_io(
         let file = std::fs::OpenOptions::new()
             .read(read)
             .write(write)
-            .create_new(create_new_truncate)
+            .create(write)
             .open(path)
             .unwrap();
         match args.direct_io {
