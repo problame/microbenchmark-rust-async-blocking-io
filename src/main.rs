@@ -199,34 +199,38 @@ fn alloc_self_aligned_buffer(size: usize) -> *mut u8 {
 fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     let data_dir = data_dir(args);
     std::fs::create_dir_all(&data_dir).unwrap();
-    for i in 0..args.num_clients.get() {
-        let file_path = data_file_path(args, i);
-        match std::fs::metadata(&file_path) {
-            Ok(md) => {
-                if md.len() == args.file_size_mib.get() * 1024 * 1024 {
-                    continue;
-                } else {
-                    info!("File {:?} exists but has wrong size", file_path);
-                    std::fs::remove_file(&file_path).unwrap();
+    std::thread::scope(|scope| {
+        for i in 0..args.num_clients.get() {
+            let file_path = data_file_path(args, i);
+            match std::fs::metadata(&file_path) {
+                Ok(md) => {
+                    if md.len() == args.file_size_mib.get() * 1024 * 1024 {
+                        continue;
+                    } else {
+                        info!("File {:?} exists but has wrong size", file_path);
+                        std::fs::remove_file(&file_path).unwrap();
+                    }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
-        }
-        let mut file = open_file_direct_io(
-            disk_access_kind,
-            OpenFileMode::WriteCreateNewTruncate,
-            &file_path,
-        );
+            let mut file = open_file_direct_io(
+                disk_access_kind,
+                OpenFileMode::WriteCreateNewTruncate,
+                &file_path,
+            );
 
-        // fill the file with pseudo-random data
-        let chunk = alloc_self_aligned_buffer(1 << 20);
-        let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
-        for _ in 0..args.file_size_mib.get() {
-            rand::thread_rng().fill_bytes(chunk);
-            file.write_all(&chunk).unwrap();
+            // fill the file with pseudo-random data
+            scope.spawn(move || {
+                let chunk = alloc_self_aligned_buffer(1 << 20);
+                let chunk = unsafe { std::slice::from_raw_parts_mut(chunk, 1 << 20) };
+                for _ in 0..args.file_size_mib.get() {
+                    rand::thread_rng().fill_bytes(chunk);
+                    file.write_all(&chunk).unwrap();
+                }
+            });
         }
-    }
+    });
 }
 
 fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
