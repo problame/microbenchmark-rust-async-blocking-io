@@ -82,13 +82,18 @@ struct EngineTokioSpawnBlocking {
     rt: tokio::runtime::Runtime,
 }
 
+struct StatsState {
+    reads_in_last_second: AtomicU64,
+    client0_latency_sample: AtomicU64,
+}
+
 trait Engine {
     fn run(
         self: Arc<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
-        reads_in_last_second: Arc<AtomicU64>,
+        reads_in_last_second: Arc<StatsState>,
     );
 }
 
@@ -105,7 +110,10 @@ fn main() {
 
     let engine = setup_engine(&args.work_kind.engine());
 
-    let reads_in_last_second = Arc::new(AtomicU64::new(0));
+    let stats_state = Arc::new(StatsState {
+        reads_in_last_second: AtomicU64::new(0),
+        client0_latency_sample: AtomicU64::new(0),
+    });
 
     ctrlc::set_handler({
         let stop = Arc::clone(&stop);
@@ -120,21 +128,25 @@ fn main() {
 
     let monitor = std::thread::spawn({
         let stop = Arc::clone(&stop);
-        let reads_in_last_second = Arc::clone(&reads_in_last_second);
+        let stats_state = Arc::clone(&stats_state);
+
         move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let reads_in_last_second = reads_in_last_second.swap(0, Ordering::Relaxed);
+                let reads_in_last_second =
+                    stats_state.reads_in_last_second.swap(0, Ordering::Relaxed);
+                let client0_latency_sample = stats_state.client0_latency_sample.swap(0, Ordering::Relaxed);
                 info!(
-                    "IOPS {} BANDWIDTH {} MiB/s",
+                    "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
                     reads_in_last_second,
+                    client0_latency_sample,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                 );
             }
         }
     });
 
-    engine.run(&args, works, stop, reads_in_last_second);
+    engine.run(&args, works, stop, stats_state);
     monitor.join().unwrap();
 }
 
@@ -332,15 +344,15 @@ impl Engine for EngineStd {
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
-        reads_in_last_second: Arc<AtomicU64>,
+        stats_state: Arc<StatsState>,
     ) {
         std::thread::scope(|scope| {
             assert_eq!(works.len(), args.num_clients.get() as usize);
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
-                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                let stats_state = Arc::clone(&stats_state);
                 let myself = Arc::clone(&self);
-                scope.spawn(move || myself.client(i, &args, work, &stop, &reads_in_last_second));
+                scope.spawn(move || myself.client(i, &args, work, &stop, stats_state));
             }
         });
     }
@@ -352,7 +364,7 @@ impl EngineStd {
         args: &Args,
         mut work: ClientWork,
         stop: &AtomicBool,
-        reads_in_last_second: &AtomicU64,
+        stats_state: Arc<StatsState>,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
@@ -368,6 +380,7 @@ impl EngineStd {
             let offset_in_file = rand::thread_rng()
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size))
                 * block_size;
+            let start = std::time::Instant::now();
             match &mut work {
                 ClientWork::DiskAccess { file } => {
                     self.read_iter(i, args, file, offset_in_file, buf);
@@ -376,7 +389,14 @@ impl EngineStd {
                     timerfd.read();
                 }
             }
-            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+            stats_state
+                .reads_in_last_second
+                .fetch_add(1, Ordering::Relaxed);
+            if i == 0 {
+                stats_state
+                    .client0_latency_sample
+                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
         info!("Client {i} stopping");
     }
@@ -402,7 +422,7 @@ impl Engine for EngineTokioSpawnBlocking {
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
-        reads_in_last_second: Arc<AtomicU64>,
+        stats_state: Arc<StatsState>,
     ) {
         let rt = &self.rt;
         rt.block_on(async {
@@ -410,9 +430,9 @@ impl Engine for EngineTokioSpawnBlocking {
             assert_eq!(works.len(), args.num_clients.get() as usize);
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
-                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                let stats_state = Arc::clone(&stats_state);
                 handles.push(tokio::spawn(async move {
-                    Self::client(i, &args, work, &stop, &reads_in_last_second).await
+                    Self::client(i, &args, work, &stop, stats_state).await
                 }));
             }
             for handle in handles {
@@ -428,7 +448,7 @@ impl EngineTokioSpawnBlocking {
         args: &Args,
         work: ClientWork,
         stop: &AtomicBool,
-        reads_in_last_second: &AtomicU64,
+        stats_state: Arc<StatsState>,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
@@ -469,6 +489,7 @@ impl EngineTokioSpawnBlocking {
             let offset_in_file = rand::thread_rng()
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
                 * block_size_u64;
+            let start = std::time::Instant::now();
             tokio::task::spawn_blocking(move || {
                 match fd {
                     ClientWorkFd::DiskAccess(file_fd) => {
@@ -489,7 +510,14 @@ impl EngineTokioSpawnBlocking {
             })
             .await
             .unwrap();
-            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+            stats_state
+                .reads_in_last_second
+                .fetch_add(1, Ordering::Relaxed);
+            if i == 0 {
+                stats_state
+                    .client0_latency_sample
+                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
         info!("Client {i} stopping");
     }
@@ -507,7 +535,7 @@ impl Engine for EngineTokioFlume {
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
-        reads_in_last_second: Arc<AtomicU64>,
+        stats_state: Arc<StatsState>,
     ) {
         let (worker_tx, work_rx) = flume::bounded(self.queue_depth.get() as usize);
         let mut handles = Vec::new();
@@ -525,12 +553,12 @@ impl Engine for EngineTokioFlume {
             let mut handles = Vec::new();
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
-                let reads_in_last_second = Arc::clone(&reads_in_last_second);
+                let stats_state = Arc::clone(&stats_state);
                 let worker_tx = worker_tx.clone();
                 let myself = Arc::clone(&self);
                 handles.push(tokio::spawn(async move {
                     myself
-                        .client(worker_tx, i, &args, work, &stop, &reads_in_last_second)
+                        .client(worker_tx, i, &args, work, &stop, stats_state)
                         .await
                 }));
             }
@@ -557,7 +585,7 @@ impl EngineTokioFlume {
         args: &Args,
         work: ClientWork,
         stop: &AtomicBool,
-        reads_in_last_second: &AtomicU64,
+        stats_state: Arc<StatsState>,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
@@ -620,6 +648,7 @@ impl EngineTokioFlume {
             });
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let start = std::time::Instant::now();
             worker_tx
                 .send_async(FlumeWorkRequest {
                     work,
@@ -631,7 +660,14 @@ impl EngineTokioFlume {
                 .await
                 .expect("rx flume")
                 .expect("not expecting io errors");
-            reads_in_last_second.fetch_add(1, Ordering::Relaxed);
+            stats_state
+                .reads_in_last_second
+                .fetch_add(1, Ordering::Relaxed);
+            if i == 0 {
+                stats_state
+                    .client0_latency_sample
+                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
         info!("Client {i} stopping");
     }
