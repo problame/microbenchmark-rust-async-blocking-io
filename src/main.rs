@@ -85,7 +85,6 @@ struct EngineTokioSpawnBlocking {
 struct StatsState {
     reads_in_last_second: AtomicU64,
     client0_latency_sample: AtomicU64,
-    latency_histo: Arc<histogram::Histogram>,
 }
 
 trait Engine {
@@ -114,19 +113,6 @@ fn main() {
     let stats_state = Arc::new(StatsState {
         reads_in_last_second: AtomicU64::new(0),
         client0_latency_sample: AtomicU64::new(0),
-        latency_histo: Arc::new(
-            // histogram::Histogram::builder()
-            //     .min_resolution(1)
-            //     .maximum_value(1_000_000)
-            //     .build()
-            //     .unwrap(),
-            histogram::Histogram::builder()
-                .maximum_value(1_000_000_000)
-                .min_resolution(1)
-                .min_resolution_range(2048)
-                .build()
-                .unwrap(),
-        ),
     });
 
     ctrlc::set_handler({
@@ -149,24 +135,12 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let reads_in_last_second =
                     stats_state.reads_in_last_second.swap(0, Ordering::Relaxed);
-                let client0_latency_sample = stats_state
-                    .client0_latency_sample
-                    .swap(0, Ordering::Relaxed);
+                let client0_latency_sample = stats_state.client0_latency_sample.swap(0, Ordering::Relaxed);
                 info!(
-                    "IOPS {} LatClient0 {}ns BANDWIDTH {} MiB/s",
+                    "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
                     reads_in_last_second,
                     client0_latency_sample,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
-                );
-                info!(
-                    "Latency histogram: {:?}",
-                    stats_state
-                        .latency_histo
-                        .percentiles(&[0.5, 0.9, 0.99, 0.999, 0.9999])
-                        .unwrap()
-                        .into_iter()
-                        .map(|p| ((p.bucket().high() + p.bucket().low()) / 2, p.percentile()))
-                        .collect::<Vec<_>>()
                 );
             }
         }
@@ -418,10 +392,6 @@ impl EngineStd {
             stats_state
                 .reads_in_last_second
                 .fetch_add(1, Ordering::Relaxed);
-            stats_state
-                .latency_histo
-                .increment(start.elapsed().as_nanos() as u64, 1)
-                .unwrap();
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -543,10 +513,6 @@ impl EngineTokioSpawnBlocking {
             stats_state
                 .reads_in_last_second
                 .fetch_add(1, Ordering::Relaxed);
-            stats_state
-                .latency_histo
-                .increment(start.elapsed().as_nanos() as u64, 1)
-                .unwrap();
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -697,10 +663,6 @@ impl EngineTokioFlume {
             stats_state
                 .reads_in_last_second
                 .fetch_add(1, Ordering::Relaxed);
-            stats_state
-                .latency_histo
-                .increment(start.elapsed().as_nanos() as u64, 1)
-                .unwrap();
             if i == 0 {
                 stats_state
                     .client0_latency_sample
