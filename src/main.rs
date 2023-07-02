@@ -10,7 +10,8 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
-    }, time::Duration,
+    },
+    time::Duration,
 };
 
 use clap::Parser;
