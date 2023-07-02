@@ -152,7 +152,7 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             for i in 0..args.num_clients.get() {
                 let file_path = data_file_path(args, i);
                 let md = std::fs::metadata(&file_path).unwrap();
-                assert_eq!(md.len(), args.file_size_mib.get() * 1024 * 1024);
+                assert!(md.len() >= args.file_size_mib.get() * 1024 * 1024);
 
                 let file = open_file_direct_io(
                     disk_access_kind,
@@ -205,7 +205,7 @@ fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
             let file_path = data_file_path(args, i);
             match std::fs::metadata(&file_path) {
                 Ok(md) => {
-                    if md.len() == args.file_size_mib.get() * 1024 * 1024 {
+                    if md.len() >= args.file_size_mib.get() * 1024 * 1024 {
                         continue;
                     } else {
                         info!("File {:?} exists but has wrong size", file_path);
