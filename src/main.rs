@@ -109,7 +109,10 @@ fn main() {
     ctrlc::set_handler({
         let stop = Arc::clone(&stop);
         move || {
-            stop.store(true, Ordering::Relaxed);
+            if stop.fetch_or(true, Ordering::Relaxed) {
+                error!("Received second SIGINT, aborting");
+                std::process::abort();
+            }
         }
     })
     .unwrap();
