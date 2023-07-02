@@ -3,14 +3,14 @@ use std::{
     io::Write,
     num::NonZeroU64,
     os::{
-        fd::{FromRawFd, IntoRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::prelude::FileExt,
     },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
-    },
+    }, time::Duration,
 };
 
 use clap::Parser;
@@ -139,21 +139,7 @@ fn main() {
 
 enum ClientWork {
     DiskAccess { file: std::fs::File },
-    TimerFd { timerfd: () },
-}
-
-enum ClientWorkDiscriminant {
-    DiskAccess,
-    TimerFd,
-}
-
-impl ClientWork {
-    fn discriminant(&self) -> ClientWorkDiscriminant {
-        match self {
-            ClientWork::DiskAccess { .. } => ClientWorkDiscriminant::DiskAccess,
-            ClientWork::TimerFd { .. } => ClientWorkDiscriminant::TimerFd,
-        }
-    }
+    TimerFd { timerfd: timerfd::TimerFd },
 }
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
@@ -176,8 +162,23 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             }
             client_files
         }
-        WorkKind::TimerFd { .. } => (0..args.num_clients.get())
-            .map(|_| ClientWork::TimerFd { timerfd: () })
+        WorkKind::TimerFd { micros, engine: _ } => (0..args.num_clients.get())
+            .map(|_| ClientWork::TimerFd {
+                timerfd: {
+                    let mut fd =
+                        timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true)
+                            .unwrap();
+                    let micros = Duration::from_micros(micros.get());
+                    fd.set_state(
+                        timerfd::TimerState::Periodic {
+                            current: micros,
+                            interval: micros,
+                        },
+                        timerfd::SetTimeFlags::Default,
+                    );
+                    fd
+                },
+            })
             .collect(),
     }
 }
@@ -361,7 +362,9 @@ impl EngineStd {
                 ClientWork::DiskAccess { file } => {
                     self.read_iter(i, args, file, offset_in_file, buf);
                 }
-                ClientWork::TimerFd { timerfd } => todo!(),
+                ClientWork::TimerFd { timerfd } => {
+                    timerfd.read();
+                }
             }
             reads_in_last_second.fetch_add(1, Ordering::Relaxed);
         }
@@ -413,14 +416,14 @@ impl EngineTokioSpawnBlocking {
     async fn client(
         i: u64,
         args: &Args,
-        mut work: ClientWork,
+        work: ClientWork,
         stop: &AtomicBool,
         reads_in_last_second: &AtomicU64,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        #[derive(Clone, Copy)]
+        #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
             TimerFd(RawFd),
@@ -428,7 +431,11 @@ impl EngineTokioSpawnBlocking {
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd } => todo!(),
+            ClientWork::TimerFd { timerfd } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd());
+                std::mem::forget(timerfd); // they don't support into_raw_fd
+                ret
+            }
         };
 
         // alloc aligned to make O_DIRECT work
@@ -462,7 +469,12 @@ impl EngineTokioSpawnBlocking {
                         file.read_at(buf, offset_in_file).unwrap();
                         file.into_raw_fd(); // so that it's there for next iteration
                     }
-                    ClientWorkFd::TimerFd(timerfd) => todo!(),
+                    ClientWorkFd::TimerFd(timerfd) => {
+                        let fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                        fd.read();
+                        let owned: OwnedFd = fd.into();
+                        std::mem::forget(owned);
+                    }
                 }
             })
             .await
@@ -533,14 +545,14 @@ impl EngineTokioFlume {
         worker_tx: flume::Sender<FlumeWorkRequest>,
         i: u64,
         args: &Args,
-        mut work: ClientWork,
+        work: ClientWork,
         stop: &AtomicBool,
         reads_in_last_second: &AtomicU64,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        #[derive(Clone, Copy)]
+        #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
             TimerFd(RawFd),
@@ -548,7 +560,11 @@ impl EngineTokioFlume {
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd } => todo!(),
+            ClientWork::TimerFd { timerfd } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd());
+                std::mem::forget(timerfd); // they don't support into_raw_fd
+                ret
+            }
         };
 
         // alloc aligned to make O_DIRECT work
@@ -583,7 +599,13 @@ impl EngineTokioFlume {
                         file.into_raw_fd(); // so that it's there for next iteration
                         Ok(())
                     }
-                    ClientWorkFd::TimerFd(timerfd) => todo!(),
+                    ClientWorkFd::TimerFd(timerfd) => {
+                        let fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                        fd.read();
+                        let owned: OwnedFd = fd.into();
+                        std::mem::forget(owned);
+                        Ok(())
+                    }
                 }
             });
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
