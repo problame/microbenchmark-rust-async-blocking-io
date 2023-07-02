@@ -3,7 +3,7 @@ use std::{
     io::Write,
     num::NonZeroU64,
     os::{
-        fd::{FromRawFd, IntoRawFd},
+        fd::{FromRawFd, IntoRawFd, RawFd},
         unix::prelude::FileExt,
     },
     path::{Path, PathBuf},
@@ -22,15 +22,45 @@ struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
-    direct_io: DirectIoMode,
     #[clap(subcommand)]
-    engine: EngineKind,
+    work_kind: WorkKind,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum DirectIoMode {
-    DirectIo,
-    CachedIo,
+#[derive(Clone, Copy, clap::Subcommand)]
+enum WorkKind {
+    DiskAccess {
+        #[clap(subcommand)]
+        disk_access_kind: DiskAccessKind,
+    },
+    TimerFd {
+        micros: NonZeroU64,
+        #[clap(subcommand)]
+        engine: EngineKind,
+    },
+}
+
+impl WorkKind {
+    fn engine(&self) -> &EngineKind {
+        match self {
+            WorkKind::TimerFd { engine, .. } => engine,
+            WorkKind::DiskAccess { disk_access_kind } => match disk_access_kind {
+                DiskAccessKind::DirectIo { engine } => engine,
+                DiskAccessKind::CachedIo { engine } => engine,
+            },
+        }
+    }
+}
+
+#[derive(Copy, Clone, clap::Subcommand)]
+enum DiskAccessKind {
+    DirectIo {
+        #[clap(subcommand)]
+        engine: EngineKind,
+    },
+    CachedIo {
+        #[clap(subcommand)]
+        engine: EngineKind,
+    },
 }
 
 #[derive(Clone, Copy, clap::Subcommand)]
@@ -55,6 +85,7 @@ trait Engine {
     fn run(
         self: Arc<Self>,
         args: &'static Args,
+        works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
     );
@@ -69,9 +100,9 @@ fn main() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    setup_files(&args);
+    let works = setup_client_works(&args);
 
-    let engine = setup_engine(&args);
+    let engine = setup_engine(&args.work_kind.engine());
 
     let reads_in_last_second = Arc::new(AtomicU64::new(0));
 
@@ -99,8 +130,53 @@ fn main() {
         }
     });
 
-    engine.run(&args, stop, reads_in_last_second);
+    engine.run(&args, works, stop, reads_in_last_second);
     monitor.join().unwrap();
+}
+
+enum ClientWork {
+    DiskAccess { file: std::fs::File },
+    TimerFd { timerfd: () },
+}
+
+enum ClientWorkDiscriminant {
+    DiskAccess,
+    TimerFd,
+}
+
+impl ClientWork {
+    fn discriminant(&self) -> ClientWorkDiscriminant {
+        match self {
+            ClientWork::DiskAccess { .. } => ClientWorkDiscriminant::DiskAccess,
+            ClientWork::TimerFd { .. } => ClientWorkDiscriminant::TimerFd,
+        }
+    }
+}
+
+fn setup_client_works(args: &Args) -> Vec<ClientWork> {
+    match &args.work_kind {
+        WorkKind::DiskAccess { disk_access_kind } => {
+            setup_files(&args, disk_access_kind);
+            // assert invariant and open files
+            let mut client_files = Vec::new();
+            for i in 0..args.num_clients.get() {
+                let file_path = data_file_path(args, i);
+                let md = std::fs::metadata(&file_path).unwrap();
+                assert_eq!(md.len(), args.file_size_mib.get() * 1024 * 1024);
+
+                let file = open_file_direct_io(
+                    disk_access_kind,
+                    OpenFileMode::Read,
+                    &data_file_path(args, i),
+                );
+                client_files.push(ClientWork::DiskAccess { file });
+            }
+            client_files
+        }
+        WorkKind::TimerFd { .. } => (0..args.num_clients.get())
+            .map(|_| ClientWork::TimerFd { timerfd: () })
+            .collect(),
+    }
 }
 
 fn data_dir(_args: &Args) -> PathBuf {
@@ -116,7 +192,7 @@ fn alloc_self_aligned_buffer(size: usize) -> *mut u8 {
     buf_ptr
 }
 
-fn setup_files(args: &Args) {
+fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     let data_dir = data_dir(args);
     std::fs::create_dir_all(&data_dir).unwrap();
     for i in 0..args.num_clients.get() {
@@ -133,7 +209,11 @@ fn setup_files(args: &Args) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("Error while checking file {:?}: {}", file_path, e),
         }
-        let mut file = open_file_direct_io(args, OpenFileMode::WriteCreateNewTruncate, &file_path);
+        let mut file = open_file_direct_io(
+            disk_access_kind,
+            OpenFileMode::WriteCreateNewTruncate,
+            &file_path,
+        );
 
         // fill the file with pseudo-random data
         let chunk = alloc_self_aligned_buffer(1 << 20);
@@ -143,16 +223,10 @@ fn setup_files(args: &Args) {
             file.write_all(&chunk).unwrap();
         }
     }
-    // assert invariant
-    for i in 0..args.num_clients.get() {
-        let file_path = data_dir.join(&format!("client_{}.data", i));
-        let md = std::fs::metadata(&file_path).unwrap();
-        assert_eq!(md.len(), args.file_size_mib.get() * 1024 * 1024);
-    }
 }
 
-fn setup_engine(args: &Args) -> Arc<dyn Engine> {
-    match args.engine {
+fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
+    match engine_kind {
         EngineKind::Std => Arc::new(EngineStd {}),
         EngineKind::TokioSpawnBlocking {
             spawn_blocking_pool_size,
@@ -174,8 +248,8 @@ fn setup_engine(args: &Args) -> Arc<dyn Engine> {
                 .unwrap();
             Arc::new(EngineTokioFlume {
                 rt,
-                num_workers: workers,
-                queue_depth,
+                num_workers: *workers,
+                queue_depth: *queue_depth,
             })
         }
     }
@@ -186,7 +260,11 @@ enum OpenFileMode {
     WriteCreateNewTruncate,
 }
 
-fn open_file_direct_io(args: &Args, mode: OpenFileMode, path: &Path) -> std::fs::File {
+fn open_file_direct_io(
+    disk_access_kind: &DiskAccessKind,
+    mode: OpenFileMode,
+    path: &Path,
+) -> std::fs::File {
     let (read, write, create_new_truncate) = match mode {
         OpenFileMode::Read => (true, false, false),
         OpenFileMode::WriteCreateNewTruncate => (false, true, true),
@@ -199,11 +277,11 @@ fn open_file_direct_io(args: &Args, mode: OpenFileMode, path: &Path) -> std::fs:
             .read(read)
             .write(write)
             .create_new(create_new_truncate);
-        match args.direct_io {
-            DirectIoMode::DirectIo => {
+        match disk_access_kind {
+            DiskAccessKind::DirectIo { engine: _ } => {
                 options.custom_flags(libc::O_DIRECT);
             }
-            DirectIoMode::CachedIo => {}
+            DiskAccessKind::CachedIo { engine: _ } => {}
         }
         options.open(path).unwrap()
     }
@@ -223,12 +301,12 @@ fn open_file_direct_io(args: &Args, mode: OpenFileMode, path: &Path) -> std::fs:
             .open(path)
             .unwrap();
         match args.direct_io {
-            DirectIoMode::DirectIo => {
+            WorkKind::DirectIo => {
                 let fd = file.as_raw_fd();
                 let res = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
                 assert_eq!(res, 0);
             }
-            DirectIoMode::CachedIo => {}
+            WorkKind::CachedIo => {}
         }
         file
     }
@@ -238,23 +316,31 @@ impl Engine for EngineStd {
     fn run(
         self: Arc<Self>,
         args: &'static Args,
+        works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
     ) {
         std::thread::scope(|scope| {
-            for i in 0..args.num_clients.get() {
+            assert_eq!(works.len(), args.num_clients.get() as usize);
+            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let reads_in_last_second = Arc::clone(&reads_in_last_second);
                 let myself = Arc::clone(&self);
-                scope.spawn(move || myself.client(i, &args, &stop, &reads_in_last_second));
+                scope.spawn(move || myself.client(i, &args, work, &stop, &reads_in_last_second));
             }
         });
     }
 }
 impl EngineStd {
-    fn client(&self, i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
+    fn client(
+        &self,
+        i: u64,
+        args: &Args,
+        mut work: ClientWork,
+        stop: &AtomicBool,
+        reads_in_last_second: &AtomicU64,
+    ) {
         tracing::info!("Client {i} starting");
-        let mut file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
         let block_size = 1 << args.block_size_shift.get();
         // alloc aligned to make O_DIRECT work
         let buf =
@@ -268,7 +354,12 @@ impl EngineStd {
             let offset_in_file = rand::thread_rng()
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size))
                 * block_size;
-            self.read_iter(i, args, &mut file, offset_in_file, buf);
+            match &mut work {
+                ClientWork::DiskAccess { file } => {
+                    self.read_iter(i, args, file, offset_in_file, buf);
+                }
+                ClientWork::TimerFd { timerfd } => todo!(),
+            }
             reads_in_last_second.fetch_add(1, Ordering::Relaxed);
         }
         info!("Client {i} stopping");
@@ -293,17 +384,19 @@ impl Engine for EngineTokioSpawnBlocking {
     fn run(
         self: Arc<Self>,
         args: &'static Args,
+        works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
     ) {
         let rt = &self.rt;
         rt.block_on(async {
             let mut handles = Vec::new();
-            for i in 0..args.num_clients.get() {
+            assert_eq!(works.len(), args.num_clients.get() as usize);
+            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let reads_in_last_second = Arc::clone(&reads_in_last_second);
                 handles.push(tokio::spawn(async move {
-                    Self::client(i, &args, &stop, &reads_in_last_second).await
+                    Self::client(i, &args, work, &stop, &reads_in_last_second).await
                 }));
             }
             for handle in handles {
@@ -314,12 +407,26 @@ impl Engine for EngineTokioSpawnBlocking {
 }
 
 impl EngineTokioSpawnBlocking {
-    async fn client(i: u64, args: &Args, stop: &AtomicBool, reads_in_last_second: &AtomicU64) {
+    async fn client(
+        i: u64,
+        args: &Args,
+        mut work: ClientWork,
+        stop: &AtomicBool,
+        reads_in_last_second: &AtomicU64,
+    ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
-        let file_fd = file.into_raw_fd();
+        #[derive(Clone, Copy)]
+        enum ClientWorkFd {
+            DiskAccess(RawFd),
+            TimerFd(RawFd),
+        }
+
+        let fd = match work {
+            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::TimerFd { timerfd } => todo!(),
+        };
 
         // alloc aligned to make O_DIRECT work
         let buf = {
@@ -343,11 +450,17 @@ impl EngineTokioSpawnBlocking {
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
                 * block_size_u64;
             tokio::task::spawn_blocking(move || {
-                let buf = buf;
-                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
-                let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
-                file.read_at(buf, offset_in_file).unwrap();
-                file.into_raw_fd(); // so that it's there for next iteration
+                match fd {
+                    ClientWorkFd::DiskAccess(file_fd) => {
+                        let buf = buf;
+                        let buf: &mut [u8] =
+                            unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
+                        let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+                        file.read_at(buf, offset_in_file).unwrap();
+                        file.into_raw_fd(); // so that it's there for next iteration
+                    }
+                    ClientWorkFd::TimerFd(timerfd) => todo!(),
+                }
             })
             .await
             .unwrap();
@@ -367,6 +480,7 @@ impl Engine for EngineTokioFlume {
     fn run(
         self: Arc<Self>,
         args: &'static Args,
+        works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<AtomicU64>,
     ) {
@@ -384,14 +498,14 @@ impl Engine for EngineTokioFlume {
         let rt = &self.rt;
         rt.block_on(async {
             let mut handles = Vec::new();
-            for i in 0..args.num_clients.get() {
+            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let reads_in_last_second = Arc::clone(&reads_in_last_second);
                 let worker_tx = worker_tx.clone();
                 let myself = Arc::clone(&self);
                 handles.push(tokio::spawn(async move {
                     myself
-                        .client(worker_tx, i, &args, &stop, &reads_in_last_second)
+                        .client(worker_tx, i, &args, work, &stop, &reads_in_last_second)
                         .await
                 }));
             }
@@ -416,14 +530,23 @@ impl EngineTokioFlume {
         worker_tx: flume::Sender<FlumeWorkRequest>,
         i: u64,
         args: &Args,
+        mut work: ClientWork,
         stop: &AtomicBool,
         reads_in_last_second: &AtomicU64,
     ) {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
-        let file = open_file_direct_io(args, OpenFileMode::Read, &data_file_path(args, i));
-        let file_fd = file.into_raw_fd();
+        #[derive(Clone, Copy)]
+        enum ClientWorkFd {
+            DiskAccess(RawFd),
+            TimerFd(RawFd),
+        }
+
+        let fd = match work {
+            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::TimerFd { timerfd } => todo!(),
+        };
 
         // alloc aligned to make O_DIRECT work
         let buf = {
@@ -447,12 +570,18 @@ impl EngineTokioFlume {
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
                 * block_size_u64;
             let work = Box::new(move || {
-                let buf = buf;
-                let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
-                let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
-                file.read_at(buf, offset_in_file).unwrap();
-                file.into_raw_fd(); // so that it's there for next iteration
-                Ok(())
+                match fd {
+                    ClientWorkFd::DiskAccess(file_fd) => {
+                        let buf = buf;
+                        let buf: &mut [u8] =
+                            unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
+                        let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+                        file.read_at(buf, offset_in_file).unwrap();
+                        file.into_raw_fd(); // so that it's there for next iteration
+                        Ok(())
+                    }
+                    ClientWorkFd::TimerFd(timerfd) => todo!(),
+                }
             });
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
