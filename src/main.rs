@@ -136,7 +136,9 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let reads_in_last_second =
                     stats_state.reads_in_last_second.swap(0, Ordering::Relaxed);
-                let client0_latency_sample = stats_state.client0_latency_sample.swap(0, Ordering::Relaxed);
+                let client0_latency_sample = stats_state
+                    .client0_latency_sample
+                    .swap(0, Ordering::Relaxed);
                 info!(
                     "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
                     reads_in_last_second,
