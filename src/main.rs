@@ -453,6 +453,9 @@ impl EngineTokioSpawnBlocking {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
+        let rwlock = Arc::new(tokio::sync::RwLock::new(()));
+        std::mem::forget(Arc::clone(&rwlock));
+
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
@@ -484,6 +487,9 @@ impl EngineTokioSpawnBlocking {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            // simulate Timeline::layers.read().await
+            let _guard = rwlock.read().await;
+
             // find a random aligned 8k offset inside the file
             debug_assert!(1024 * 1024 % block_size == 0);
             let offset_in_file = rand::thread_rng()
@@ -590,6 +596,9 @@ impl EngineTokioFlume {
         tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
+        let rwlock = Arc::new(tokio::sync::RwLock::new(()));
+        std::mem::forget(Arc::clone(&rwlock));
+
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
@@ -621,6 +630,9 @@ impl EngineTokioFlume {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            // simulate Timeline::layers.read().await
+            let _guard = rwlock.read().await;
+
             // find a random aligned 8k offset inside the file
             debug_assert!(1024 * 1024 % block_size == 0);
             let offset_in_file = rand::thread_rng()
