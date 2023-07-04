@@ -34,6 +34,18 @@ enum WorkKind {
         disk_access_kind: DiskAccessKind,
     },
     TimerFd {
+        #[clap(subcommand)]
+        expiration_mode: TimerFdExperiationModeKind,
+    },
+    NoWork {
+        #[clap(subcommand)]
+        engine: EngineKind,
+    },
+}
+
+#[derive(Clone, Copy, clap::Subcommand)]
+enum TimerFdExperiationModeKind {
+    Oneshot {
         micros: NonZeroU64,
         #[clap(subcommand)]
         engine: EngineKind,
@@ -43,11 +55,14 @@ enum WorkKind {
 impl WorkKind {
     fn engine(&self) -> &EngineKind {
         match self {
-            WorkKind::TimerFd { engine, .. } => engine,
+            WorkKind::TimerFd { expiration_mode } => match expiration_mode {
+                TimerFdExperiationModeKind::Oneshot { engine, .. } => engine,
+            },
             WorkKind::DiskAccess { disk_access_kind } => match disk_access_kind {
                 DiskAccessKind::DirectIo { engine } => engine,
                 DiskAccessKind::CachedIo { engine } => engine,
             },
+            WorkKind::NoWork { engine } => engine,
         }
     }
 }
@@ -157,10 +172,11 @@ enum ClientWork {
     DiskAccess {
         file: std::fs::File,
     },
-    TimerFd {
+    TimerFdSetStateAndRead {
         timerfd: timerfd::TimerFd,
         duration: Duration,
     },
+    NoWork {},
 }
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
@@ -183,13 +199,21 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
             }
             client_files
         }
-        WorkKind::TimerFd { micros, engine: _ } => (0..args.num_clients.get())
-            .map(|_| ClientWork::TimerFd {
-                timerfd: {
-                    timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true).unwrap()
-                },
-                duration: Duration::from_micros(micros.get()),
+        WorkKind::TimerFd { expiration_mode } => (0..args.num_clients.get())
+            .map(|_| match expiration_mode {
+                TimerFdExperiationModeKind::Oneshot { micros, engine: _ } => {
+                    ClientWork::TimerFdSetStateAndRead {
+                        timerfd: {
+                            timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true)
+                                .unwrap()
+                        },
+                        duration: Duration::from_micros(micros.get()),
+                    }
+                }
             })
+            .collect(),
+        WorkKind::NoWork { engine: _ } => (0..args.num_clients.get())
+            .map(|_| ClientWork::NoWork {})
             .collect(),
     }
 }
@@ -390,13 +414,14 @@ impl EngineStd {
                 ClientWork::DiskAccess { file } => {
                     self.read_iter(i, args, file, offset_in_file, buf);
                 }
-                ClientWork::TimerFd { timerfd, duration } => {
+                ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                     timerfd.set_state(
                         timerfd::TimerState::Oneshot(*duration),
                         timerfd::SetTimeFlags::Default,
                     );
                     timerfd.read();
                 }
+                ClientWork::NoWork {} => {}
             }
             stats_state
                 .reads_in_last_second
@@ -498,13 +523,14 @@ impl EngineTokioOnExecutorThread {
                 ClientWork::DiskAccess { file } => {
                     file.read_at(buf, offset_in_file).unwrap();
                 }
-                ClientWork::TimerFd { timerfd, duration } => {
+                ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                     timerfd.set_state(
                         timerfd::TimerState::Oneshot(*duration),
                         timerfd::SetTimeFlags::Default,
                     );
                     timerfd.read();
                 }
+                ClientWork::NoWork {} => {}
             }
             stats_state
                 .reads_in_last_second
@@ -564,15 +590,17 @@ impl EngineTokioSpawnBlocking {
         enum ClientWorkFd {
             DiskAccess(RawFd),
             TimerFd(RawFd, Duration),
+            NoWork,
         }
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd, duration } => {
+            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
+            ClientWork::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -620,6 +648,7 @@ impl EngineTokioSpawnBlocking {
                         let owned: OwnedFd = fd.into();
                         std::mem::forget(owned);
                     }
+                    ClientWorkFd::NoWork => {}
                 }
             })
             .await
@@ -711,15 +740,17 @@ impl EngineTokioFlume {
         enum ClientWorkFd {
             DiskAccess(RawFd),
             TimerFd(RawFd, Duration),
+            NoWork,
         }
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd, duration } => {
+            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
+            ClientWork::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -768,6 +799,7 @@ impl EngineTokioFlume {
                         std::mem::forget(owned);
                         Ok(())
                     }
+                    ClientWorkFd::NoWork => Ok(()),
                 }
             });
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
