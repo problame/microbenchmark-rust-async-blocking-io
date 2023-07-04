@@ -154,8 +154,13 @@ fn main() {
 }
 
 enum ClientWork {
-    DiskAccess { file: std::fs::File },
-    TimerFd { timerfd: timerfd::TimerFd },
+    DiskAccess {
+        file: std::fs::File,
+    },
+    TimerFd {
+        timerfd: timerfd::TimerFd,
+        duration: Duration,
+    },
 }
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
@@ -181,19 +186,9 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
         WorkKind::TimerFd { micros, engine: _ } => (0..args.num_clients.get())
             .map(|_| ClientWork::TimerFd {
                 timerfd: {
-                    let mut fd =
-                        timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true)
-                            .unwrap();
-                    let micros = Duration::from_micros(micros.get());
-                    fd.set_state(
-                        timerfd::TimerState::Periodic {
-                            current: micros,
-                            interval: micros,
-                        },
-                        timerfd::SetTimeFlags::Default,
-                    );
-                    fd
+                    timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true).unwrap()
                 },
+                duration: Duration::from_micros(micros.get()),
             })
             .collect(),
     }
@@ -395,7 +390,11 @@ impl EngineStd {
                 ClientWork::DiskAccess { file } => {
                     self.read_iter(i, args, file, offset_in_file, buf);
                 }
-                ClientWork::TimerFd { timerfd } => {
+                ClientWork::TimerFd { timerfd, duration } => {
+                    timerfd.set_state(
+                        timerfd::TimerState::Oneshot(*duration),
+                        timerfd::SetTimeFlags::Default,
+                    );
                     timerfd.read();
                 }
             }
@@ -499,7 +498,11 @@ impl EngineTokioOnExecutorThread {
                 ClientWork::DiskAccess { file } => {
                     file.read_at(buf, offset_in_file).unwrap();
                 }
-                ClientWork::TimerFd { timerfd } => {
+                ClientWork::TimerFd { timerfd, duration } => {
+                    timerfd.set_state(
+                        timerfd::TimerState::Oneshot(*duration),
+                        timerfd::SetTimeFlags::Default,
+                    );
                     timerfd.read();
                 }
             }
@@ -560,13 +563,13 @@ impl EngineTokioSpawnBlocking {
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
-            TimerFd(RawFd),
+            TimerFd(RawFd, Duration),
         }
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd } => {
-                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd());
+            ClientWork::TimerFd { timerfd, duration } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
@@ -607,8 +610,12 @@ impl EngineTokioSpawnBlocking {
                         file.read_at(buf, offset_in_file).unwrap();
                         file.into_raw_fd(); // so that it's there for next iteration
                     }
-                    ClientWorkFd::TimerFd(timerfd) => {
-                        let fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                    ClientWorkFd::TimerFd(timerfd, duration) => {
+                        let mut fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                        fd.set_state(
+                            timerfd::TimerState::Oneshot(duration),
+                            timerfd::SetTimeFlags::Default,
+                        );
                         fd.read();
                         let owned: OwnedFd = fd.into();
                         std::mem::forget(owned);
@@ -703,13 +710,13 @@ impl EngineTokioFlume {
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
             DiskAccess(RawFd),
-            TimerFd(RawFd),
+            TimerFd(RawFd, Duration),
         }
 
         let fd = match work {
             ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
-            ClientWork::TimerFd { timerfd } => {
-                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd());
+            ClientWork::TimerFd { timerfd, duration } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
@@ -750,8 +757,12 @@ impl EngineTokioFlume {
                         file.into_raw_fd(); // so that it's there for next iteration
                         Ok(())
                     }
-                    ClientWorkFd::TimerFd(timerfd) => {
-                        let fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                    ClientWorkFd::TimerFd(timerfd, duration) => {
+                        let mut fd = unsafe { timerfd::TimerFd::from_raw_fd(timerfd) };
+                        fd.set_state(
+                            timerfd::TimerState::Oneshot(duration),
+                            timerfd::SetTimeFlags::Default,
+                        );
                         fd.read();
                         let owned: OwnedFd = fd.into();
                         std::mem::forget(owned);
