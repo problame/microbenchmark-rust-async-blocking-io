@@ -858,6 +858,10 @@ impl EngineTokioFlume {
     }
 }
 
+thread_local! {
+    static RIO_THREAD_LOCAL_RING: std::cell::RefCell<Arc<rio::Rio>>  = std::cell::RefCell::new(Arc::new(rio::new().unwrap()));
+}
+
 impl Engine for EngineTokioRio {
     fn run(
         self: Arc<Self>,
@@ -866,17 +870,14 @@ impl Engine for EngineTokioRio {
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) {
-        let rio = rio::new().unwrap();
-
         self.rt.block_on(async {
             let mut handles = Vec::new();
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let myself = Arc::clone(&self);
-                let rio = rio.clone();
                 handles.push(tokio::spawn(async move {
-                    myself.client(rio, i, &args, work, &stop, stats_state).await
+                    myself.client(i, &args, work, &stop, stats_state).await
                 }));
             }
             for handle in handles {
@@ -889,7 +890,6 @@ impl Engine for EngineTokioRio {
 impl EngineTokioRio {
     async fn client(
         &self,
-        rio: rio::Rio,
         i: u64,
         args: &Args,
         work: ClientWork,
@@ -951,6 +951,13 @@ impl EngineTokioRio {
                     let mut buf: &mut [u8] =
                         unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
                     let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+                    // We use it to get one io_uring submission & completion ring per core / executor thread.
+                    // The thread-local rings are not great if there's block_in_place in the codebase. It's fine here.
+                    // Ideally we'd have one submission ring per core and a single completion ring, because, completion
+                    // wakes up the task but we don't know which runtime it is one.
+                    // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
+                    //  affine to a completion queue somehow... The design space is big.)
+                    let rio = RIO_THREAD_LOCAL_RING.with(|rio| Arc::clone(&*rio.borrow()));
                     let count = rio.read_at(&file, &mut buf, offset_in_file).await.unwrap();
                     assert_eq!(count, buf.len());
                     file.into_raw_fd(); // so that it's there for next iteration
