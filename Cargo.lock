@@ -650,6 +650,7 @@ dependencies = [
 [[package]]
 name = "rio"
 version = "0.9.4"
+source = "git+https://github.com/problame/rio?branch=problame/hacks-to-make-eventfd-bridge-work#8386702081e5aa575760059ee6c089bd50a47618"
 dependencies = [
  "libc",
 ]
@@ -1049,3 +1050,8 @@ name = "windows_x86_64_msvc"
 version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a515f5799fe4961cb532f983ce2b23082366b898e52ffbce459c86f67c8378a"
+
+[[patch.unused]]
+name = "tokio"
+version = "1.28.1"
+source = "git+https://github.com/problame/tokio.git?branch=problame/distinguish-core-and-worker-by-thread-name#d88791686cfc7fc7d010889ad7638d09646b3de7"

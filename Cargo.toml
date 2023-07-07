@@ -23,8 +23,8 @@ tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
 
 [patch.crates-io]
-#tokio = { git = "https://github.com/problame/tokio.git", branch="problame/distinguish-core-and-worker-by-thread-name" }
-rio = { path = "../rio" }
+tokio = { git = "https://github.com/problame/tokio.git", branch="problame/distinguish-core-and-worker-by-thread-name" }
+rio = { git = "https://github.com/problame/rio",  branch = "problame/hacks-to-make-eventfd-bridge-work"}
 
 [profile.release]
 debug = 0
