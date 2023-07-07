@@ -18,12 +18,11 @@ rio = "0.9.4"
 scopeguard = "1.1.0"
 timerfd = "1.5.0"
 tokio = { version = "1.29.1", features = ["full"] }
-tokio-eventfd = "0.2.0"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
 
 [patch.crates-io]
-tokio = { git = "https://github.com/problame/tokio.git", branch="problame/distinguish-core-and-worker-by-thread-name" }
+tokio = { git = "https://github.com/problame/tokio.git", branch="problame/distinguish-core-and-worker-by-thread-name--1.29.1" }
 rio = { git = "https://github.com/problame/rio",  branch = "problame/hacks-to-make-eventfd-bridge-work"}
 
 [profile.release]

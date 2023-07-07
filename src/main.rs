@@ -14,12 +14,8 @@ use std::{
     time::Duration,
 };
 
-use byteorder::ByteOrder;
 use clap::Parser;
-use libc::c_void;
 use rand::{Rng, RngCore};
-use tokio::io::AsyncReadExt;
-use tokio_eventfd::EventFd;
 use tracing::{error, info};
 
 #[derive(clap::Parser)]
@@ -990,7 +986,7 @@ impl Engine for EngineTokioRio {
 
                         // info!("Reaper one iter");
                         match reaper.poll() {
-                            std::ops::ControlFlow::Continue(count) => {
+                            std::ops::ControlFlow::Continue(_count) => {
                                 // info!("Reaper poll got count {}", count);
                                 continue;
                             }
