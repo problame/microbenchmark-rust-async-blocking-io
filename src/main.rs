@@ -111,6 +111,7 @@ enum TokioRioModeKind {
     SingleGlobal,
     ExecutorThreadLocal,
     Epoll,
+    EpollExecutorThreadLocal,
 }
 
 enum TokioRioMode {
@@ -120,6 +121,7 @@ enum TokioRioMode {
         rio: Arc<rio::Rio>,
         reaper: Option<rio::Reaper>,
     },
+    EpollExecutorThreadLocal,
 }
 
 #[derive(Clone)]
@@ -127,7 +129,10 @@ enum TokioRioModeReduced {
     SingleGlobal(Arc<rio::Rio>),
     ExecutorThreadLocal,
     Epoll(Arc<rio::Rio>),
+    EpollExecutorThreadLocal(SetupEventfdPollingFn),
 }
+
+type SetupEventfdPollingFn = Arc<dyn Fn(&rio::Rio, rio::Reaper) + Send + Sync>;
 
 struct EngineTokioSpawnBlocking {
     rt: tokio::runtime::Runtime,
@@ -388,6 +393,10 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
                         },
                     }
                 }
+                TokioRioModeKind::EpollExecutorThreadLocal => EngineTokioRio {
+                    rt,
+                    mode: TokioRioMode::EpollExecutorThreadLocal,
+                },
             })
         }
     }
@@ -929,6 +938,10 @@ impl EngineTokioFlume {
 
 thread_local! {
     static RIO_THREAD_LOCAL_RING: std::cell::RefCell<Arc<rio::Rio>>  = std::cell::RefCell::new(Arc::new(rio::new().unwrap()));
+    static RIO_EPOLL_THREAD_LOCAL_RING: std::cell::RefCell<(Arc<rio::Rio>, Option<rio::Reaper>)>  = std::cell::RefCell::new({
+        let (rio, reaper) = rio::Config::default().start(true).unwrap();
+        (Arc::new(rio), reaper)
+    });
 }
 
 impl Engine for EngineTokioRio {
@@ -940,9 +953,12 @@ impl Engine for EngineTokioRio {
         stats_state: Arc<StatsState>,
     ) {
         let EngineTokioRio { rt, mode } = *self;
-        let mode = match mode {
-            TokioRioMode::Epoll { mut reaper, rio } => {
-                let mut reaper = reaper.take().unwrap();
+        let rt = Arc::new(rt);
+
+        let setup_eventfd_polling: SetupEventfdPollingFn = {
+            let rt = Arc::clone(&rt);
+            let stats_state = Arc::clone(&stats_state);
+            Arc::new(move |rio: &rio::Rio, mut reaper: rio::Reaper| {
                 let eventfd = eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap();
                 rio.register_eventfd_async(eventfd.as_raw_fd()).unwrap(); // TODO lifetime of the fd!
                 let stats_state = Arc::clone(&stats_state);
@@ -985,8 +1001,17 @@ impl Engine for EngineTokioRio {
                         }
                     }
                 }));
+            })
+        };
 
+        let mode = match mode {
+            TokioRioMode::Epoll { mut reaper, rio } => {
+                let reaper = reaper.take().unwrap();
+                setup_eventfd_polling(&rio, reaper);
                 TokioRioModeReduced::Epoll(rio)
+            }
+            TokioRioMode::EpollExecutorThreadLocal => {
+                TokioRioModeReduced::EpollExecutorThreadLocal(Arc::clone(&setup_eventfd_polling))
             }
             TokioRioMode::SingleGlobal(rio) => TokioRioModeReduced::SingleGlobal(rio),
             TokioRioMode::ExecutorThreadLocal => TokioRioModeReduced::ExecutorThreadLocal,
@@ -1085,6 +1110,18 @@ impl EngineTokioRio {
                             RIO_THREAD_LOCAL_RING.with(|ring| ring.borrow().clone())
                         }
                         TokioRioModeReduced::Epoll(rio) => rio.clone(),
+                        TokioRioModeReduced::EpollExecutorThreadLocal(setup_eventfd_polling) => {
+                            RIO_EPOLL_THREAD_LOCAL_RING.with(|tl| match &mut *tl.borrow_mut() {
+                                (rio, None) => {
+                                    // already set up
+                                    rio.clone()
+                                }
+                                (rio, reaper @ Some(_)) => {
+                                    setup_eventfd_polling(&rio, reaper.take().unwrap());
+                                    rio.clone()
+                                }
+                            })
+                        }
                     };
                     let count = rio.read_at(&file, &mut buf, offset_in_file).await.unwrap();
                     assert_eq!(count, buf.len());
