@@ -1,5 +1,6 @@
 use std::{
     alloc::Layout,
+    collections::HashMap,
     io::{Seek, Write},
     num::NonZeroU64,
     os::{
@@ -9,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -123,12 +124,19 @@ enum TokioRioMode {
 #[derive(Clone)]
 enum TokioRioModeReduced {
     SingleGlobal(Arc<rio::Rio>),
-    ExecutorThreadLocal,
+    ExecutorThreadLocal {
+        all_the_thread_local_rios: ThreadLocalRiosByOuterArcPtr,
+    },
     Epoll(Arc<rio::Rio>),
-    EpollExecutorThreadLocal(SetupEventfdPollingFn),
+    EpollExecutorThreadLocal {
+        setup_eventfd_poller: SetupEventfdPollingFn,
+        all_the_thread_local_rios: ThreadLocalRiosByOuterArcPtr,
+    },
 }
 
-type SetupEventfdPollingFn = Arc<dyn Fn(&rio::Rio, rio::Reaper) + Send + Sync>;
+type ThreadLocalRio = Arc<Mutex<Option<Arc<rio::Rio>>>>;
+type ThreadLocalRiosByOuterArcPtr = Arc<Mutex<HashMap<usize, ThreadLocalRio>>>;
+type SetupEventfdPollingFn = Arc<dyn Fn(&ThreadLocalRio, rio::Reaper) + Send + Sync>;
 
 struct EngineTokioSpawnBlocking {
     rt: tokio::runtime::Runtime,
@@ -201,8 +209,19 @@ fn main() {
                     client0_latency_sample,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                 );
-                if tokio_rio_epoll_iterations < 10 {
-                    tracing::warn!("Tokio RIO epoll iterations {}", tokio_rio_epoll_iterations);
+                match args.work_kind.engine() {
+                    EngineKind::TokioRio { mode } => match mode {
+                        TokioRioModeKind::Epoll | TokioRioModeKind::EpollExecutorThreadLocal => {
+                            if tokio_rio_epoll_iterations < 10 {
+                                tracing::warn!(
+                                    "Tokio RIO epoll iterations {}",
+                                    tokio_rio_epoll_iterations
+                                );
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
         }
@@ -933,10 +952,10 @@ impl EngineTokioFlume {
 }
 
 thread_local! {
-    static RIO_THREAD_LOCAL_RING: std::cell::RefCell<Arc<rio::Rio>>  = std::cell::RefCell::new(Arc::new(rio::new().unwrap()));
-    static RIO_EPOLL_THREAD_LOCAL_RING: std::cell::RefCell<(Arc<rio::Rio>, Option<rio::Reaper>)>  = std::cell::RefCell::new({
+    static RIO_THREAD_LOCAL_RING: std::cell::RefCell<(ThreadLocalRio, bool)>  = std::cell::RefCell::new((Arc::new(Mutex::new(Some(Arc::new(rio::new().unwrap())))), true));
+    static RIO_EPOLL_THREAD_LOCAL_RING: std::cell::RefCell<(ThreadLocalRio, Option<rio::Reaper>)>  = std::cell::RefCell::new({
         let (rio, reaper) = rio::Config::default().start(true).unwrap();
-        (Arc::new(rio), reaper)
+        (Arc::new(Mutex::new(Some(Arc::new(rio)))), reaper)
     });
 }
 
@@ -951,20 +970,45 @@ impl Engine for EngineTokioRio {
         let EngineTokioRio { rt, mode } = *self;
         let rt = Arc::new(rt);
 
-        let setup_eventfd_polling: SetupEventfdPollingFn = {
+        let all_the_thread_local_rios = Arc::new(Mutex::new(HashMap::new()));
+
+        type LaunchEventfdPollerFn = Arc<dyn Fn(&rio::Rio, rio::Reaper) + Send + Sync>;
+        let inner: LaunchEventfdPollerFn = Arc::new({
             let rt = Arc::clone(&rt);
             let stats_state = Arc::clone(&stats_state);
-            Arc::new(move |rio: &rio::Rio, mut reaper: rio::Reaper| {
+            move |rio: &rio::Rio, reaper: rio::Reaper| {
+                let rt = Arc::clone(&rt);
+                let stats_state = Arc::clone(&stats_state);
                 let eventfd = eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap();
                 rio.register_eventfd_async(eventfd.as_raw_fd()).unwrap(); // TODO lifetime of the fd!
                 let stats_state = Arc::clone(&stats_state);
+                // XXX: figure out if unconstrainted is actually necessary, what we want is priority boost for this task; it's the most important one
                 rt.spawn(tokio::task::unconstrained(async move {
+                    let make_guard = |reaper: rio::Reaper| {
+                        scopeguard::guard(reaper, |mut reaper| loop {
+                            match reaper.block() {
+                                std::ops::ControlFlow::Continue(_) => {
+                                    continue;
+                                }
+                                std::ops::ControlFlow::Break(_) => {
+                                    info!("Reaper task Drop observed poison");
+                                    return;
+                                }
+                            }
+                        })
+                    };
+                    let mut read_to_poison_on_drop = Some(make_guard(reaper));
+
                     let fd = tokio::io::unix::AsyncFd::new(eventfd).unwrap();
                     loop {
                         // info!("Reaper waiting for eventfd");
-                        let mut guard = fd.ready(tokio::io::Interest::READABLE).await.unwrap();
-                        assert!(guard.ready().is_readable());
+                        // See read() API docs for recipe for this code block.
                         loop {
+                            let mut guard = fd.ready(tokio::io::Interest::READABLE).await.unwrap();
+                            if !guard.ready().is_readable() {
+                                info!("spurious wakeup");
+                                continue;
+                            }
                             match fd.get_ref().read() {
                                 Ok(val) => {
                                     assert!(val > 0);
@@ -979,15 +1023,19 @@ impl Engine for EngineTokioRio {
                                 Err(e) => panic!("{:?}", e),
                             }
                         }
-                        drop(guard);
+
                         stats_state
                             .tokio_rio_epoll_iterations
                             .fetch_add(1, Ordering::Relaxed);
 
                         // info!("Reaper one iter");
+                        let mut reaper = scopeguard::ScopeGuard::into_inner(
+                            read_to_poison_on_drop.take().unwrap(),
+                        );
                         match reaper.poll() {
                             std::ops::ControlFlow::Continue(_count) => {
                                 // info!("Reaper poll got count {}", count);
+                                read_to_poison_on_drop = Some(make_guard(reaper));
                                 continue;
                             }
                             std::ops::ControlFlow::Break(()) => {
@@ -997,35 +1045,88 @@ impl Engine for EngineTokioRio {
                         }
                     }
                 }));
-            })
+            }
+        });
+
+        let add_to_thread_local_rios_and_spawn_eventfd_poller: SetupEventfdPollingFn = {
+            let rios = Arc::clone(&all_the_thread_local_rios);
+            let inner = inner.clone();
+            Arc::new(
+                move |rio: &Arc<Mutex<Option<Arc<rio::Rio>>>>, reaper: rio::Reaper| {
+                    rios.lock()
+                        .unwrap()
+                        .insert(Arc::as_ptr(&rio) as *const _ as usize, Arc::clone(rio));
+                    let rio = {
+                        let rio = rio.lock().unwrap();
+                        let rio = rio.as_ref().unwrap();
+                        Arc::clone(rio)
+                    };
+                    inner(&rio, reaper);
+                },
+            )
         };
 
         let mode = match mode {
             TokioRioMode::Epoll { mut reaper, rio } => {
                 let reaper = reaper.take().unwrap();
-                setup_eventfd_polling(&rio, reaper);
+                inner(&rio, reaper);
                 TokioRioModeReduced::Epoll(rio)
             }
             TokioRioMode::EpollExecutorThreadLocal => {
-                TokioRioModeReduced::EpollExecutorThreadLocal(Arc::clone(&setup_eventfd_polling))
+                TokioRioModeReduced::EpollExecutorThreadLocal {
+                    setup_eventfd_poller: Arc::clone(
+                        &add_to_thread_local_rios_and_spawn_eventfd_poller,
+                    ),
+                    all_the_thread_local_rios: Arc::clone(&all_the_thread_local_rios),
+                }
             }
             TokioRioMode::SingleGlobal(rio) => TokioRioModeReduced::SingleGlobal(rio),
-            TokioRioMode::ExecutorThreadLocal => TokioRioModeReduced::ExecutorThreadLocal,
+            TokioRioMode::ExecutorThreadLocal => TokioRioModeReduced::ExecutorThreadLocal {
+                all_the_thread_local_rios: Arc::clone(&all_the_thread_local_rios),
+            },
         };
-        rt.block_on(async move {
-            let mut handles = Vec::new();
-            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
-                let stop = Arc::clone(&stop);
-                let stats_state = Arc::clone(&stats_state);
-                let mode = mode.clone();
-                handles.push(tokio::spawn(async move {
-                    Self::client(mode, i, &args, work, &stop, stats_state).await
-                }));
-            }
-            for handle in handles {
-                handle.await.unwrap();
+        rt.block_on({
+            let mode = mode.clone();
+            async move {
+                let mut handles = Vec::new();
+                for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+                    let stop = Arc::clone(&stop);
+                    let stats_state = Arc::clone(&stats_state);
+                    let mode = mode.clone();
+                    handles.push(tokio::spawn(async move {
+                        Self::client(mode, i, &args, work, &stop, stats_state).await
+                    }));
+                }
+                for handle in handles {
+                    handle.await.unwrap();
+                }
             }
         });
+        // send the poison pill do make executors exit
+        match mode {
+            TokioRioModeReduced::SingleGlobal(rio) => drop(rio),
+            TokioRioModeReduced::Epoll(rio) => {
+                drop(rio);
+            }
+            TokioRioModeReduced::ExecutorThreadLocal {
+                all_the_thread_local_rios,
+                ..
+            } => {
+                for rio in all_the_thread_local_rios.lock().unwrap().values() {
+                    let rio = rio.lock().unwrap().take().unwrap();
+                    drop(rio); // send the poison pill
+                }
+            }
+            TokioRioModeReduced::EpollExecutorThreadLocal {
+                all_the_thread_local_rios,
+                ..
+            } => {
+                for rio in all_the_thread_local_rios.lock().unwrap().values() {
+                    let rio = rio.lock().unwrap().take().unwrap();
+                    drop(rio); // send the poison pill
+                }
+            }
+        }
     }
 }
 
@@ -1102,19 +1203,44 @@ impl EngineTokioRio {
                     //  affine to a completion queue somehow... The design space is big.)
                     let rio = match &mode {
                         TokioRioModeReduced::SingleGlobal(rio) => rio.clone(),
-                        TokioRioModeReduced::ExecutorThreadLocal => {
-                            RIO_THREAD_LOCAL_RING.with(|ring| ring.borrow().clone())
-                        }
+                        TokioRioModeReduced::ExecutorThreadLocal {
+                            all_the_thread_local_rios,
+                        } => RIO_THREAD_LOCAL_RING.with(|tl| match &mut *tl.borrow_mut() {
+                            (rio, needs_tracking @ true) => {
+                                let mut rios = all_the_thread_local_rios.lock().unwrap();
+                                let overwritten = rios
+                                    .insert(Arc::as_ptr(rio) as *const _ as usize, Arc::clone(rio));
+                                *needs_tracking = false;
+                                assert!(
+                                    overwritten.is_none(),
+                                    "rio already tracked for this thread but thread local says otherwise"
+                                );
+                                let rio = rio.try_lock().unwrap();
+                                Arc::clone(rio.as_ref().unwrap())
+                            }
+                            // fast path
+                            (rio, _needs_tracking @ false) => {
+                                let rio = rio.try_lock().unwrap();
+                                    Arc::clone(rio.as_ref().unwrap())
+                            }
+                        }),
                         TokioRioModeReduced::Epoll(rio) => rio.clone(),
-                        TokioRioModeReduced::EpollExecutorThreadLocal(setup_eventfd_polling) => {
+                        TokioRioModeReduced::EpollExecutorThreadLocal {
+                            setup_eventfd_poller,
+                            ..
+                        } => {
                             RIO_EPOLL_THREAD_LOCAL_RING.with(|tl| match &mut *tl.borrow_mut() {
+                                // initial path
+                                (rio, reaper @ Some(_)) => {
+                                    setup_eventfd_poller(&rio, reaper.take().unwrap());
+                                    let rio = rio.try_lock().unwrap();
+                                    Arc::clone(rio.as_ref().unwrap())
+                                }
+                                // fast path
                                 (rio, None) => {
                                     // already set up
-                                    rio.clone()
-                                }
-                                (rio, reaper @ Some(_)) => {
-                                    setup_eventfd_polling(&rio, reaper.take().unwrap());
-                                    rio.clone()
+                                    let rio = rio.try_lock().unwrap();
+                                    Arc::clone(rio.as_ref().unwrap())
                                 }
                             })
                         }

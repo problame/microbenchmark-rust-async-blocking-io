@@ -604,7 +604,7 @@ dependencies = [
 [[package]]
 name = "rio"
 version = "0.9.4"
-source = "git+https://github.com/problame/rio?branch=problame/hacks-to-make-eventfd-bridge-work#8386702081e5aa575760059ee6c089bd50a47618"
+source = "git+https://github.com/problame/rio?branch=problame/hacks-to-make-eventfd-bridge-work#a171dd456c0fca3e131869d8e587563750db647d"
 dependencies = [
  "libc",
 ]
