@@ -14,8 +14,12 @@ use std::{
     time::Duration,
 };
 
+use byteorder::ByteOrder;
 use clap::Parser;
+use libc::c_void;
 use rand::{Rng, RngCore};
+use tokio::io::AsyncReadExt;
+use tokio_eventfd::EventFd;
 use tracing::{error, info};
 
 #[derive(clap::Parser)]
@@ -90,13 +94,39 @@ enum EngineKind {
         workers: NonZeroU64,
         queue_depth: NonZeroU64,
     },
-    TokioRio,
+    TokioRio {
+        mode: TokioRioModeKind,
+    },
 }
 
 struct EngineStd {}
 
 struct EngineTokioRio {
     rt: tokio::runtime::Runtime,
+    mode: TokioRioMode,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TokioRioModeKind {
+    SingleGlobal,
+    ExecutorThreadLocal,
+    Epoll,
+}
+
+enum TokioRioMode {
+    SingleGlobal(Arc<rio::Rio>),
+    ExecutorThreadLocal,
+    Epoll {
+        rio: Arc<rio::Rio>,
+        reaper: Option<rio::Reaper>,
+    },
+}
+
+#[derive(Clone)]
+enum TokioRioModeReduced {
+    SingleGlobal(Arc<rio::Rio>),
+    ExecutorThreadLocal,
+    Epoll(Arc<rio::Rio>),
 }
 
 struct EngineTokioSpawnBlocking {
@@ -106,11 +136,12 @@ struct EngineTokioSpawnBlocking {
 struct StatsState {
     reads_in_last_second: AtomicU64,
     client0_latency_sample: AtomicU64,
+    tokio_rio_epoll_iterations: AtomicU64,
 }
 
 trait Engine {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
@@ -134,6 +165,7 @@ fn main() {
     let stats_state = Arc::new(StatsState {
         reads_in_last_second: AtomicU64::new(0),
         client0_latency_sample: AtomicU64::new(0),
+        tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
 
     ctrlc::set_handler({
@@ -159,12 +191,18 @@ fn main() {
                 let client0_latency_sample = stats_state
                     .client0_latency_sample
                     .swap(0, Ordering::Relaxed);
+                let tokio_rio_epoll_iterations = stats_state
+                    .tokio_rio_epoll_iterations
+                    .swap(0, Ordering::Relaxed);
                 info!(
                     "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
                     reads_in_last_second,
                     client0_latency_sample,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                 );
+                if tokio_rio_epoll_iterations < 10 {
+                    tracing::warn!("Tokio RIO epoll iterations {}", tokio_rio_epoll_iterations);
+                }
             }
         }
     });
@@ -281,15 +319,15 @@ fn setup_files(args: &Args, disk_access_kind: &DiskAccessKind) {
     });
 }
 
-fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
+fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
     match engine_kind {
-        EngineKind::Std => Arc::new(EngineStd {}),
+        EngineKind::Std => Box::new(EngineStd {}),
         EngineKind::TokioOnExecutorThread => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            Arc::new(EngineTokioOnExecutorThread { rt })
+            Box::new(EngineTokioOnExecutorThread { rt })
         }
         EngineKind::TokioSpawnBlocking {
             spawn_blocking_pool_size,
@@ -299,7 +337,7 @@ fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
                 .max_blocking_threads(spawn_blocking_pool_size.get() as usize)
                 .build()
                 .unwrap();
-            Arc::new(EngineTokioSpawnBlocking { rt })
+            Box::new(EngineTokioSpawnBlocking { rt })
         }
         EngineKind::TokioFlume {
             workers,
@@ -309,18 +347,49 @@ fn setup_engine(engine_kind: &EngineKind) -> Arc<dyn Engine> {
                 .enable_all()
                 .build()
                 .unwrap();
-            Arc::new(EngineTokioFlume {
+            Box::new(EngineTokioFlume {
                 rt,
                 num_workers: *workers,
                 queue_depth: *queue_depth,
             })
         }
-        EngineKind::TokioRio => Arc::new(EngineTokioRio {
-            rt: tokio::runtime::Builder::new_multi_thread()
+        EngineKind::TokioRio { mode } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .unwrap(),
-        }),
+                .unwrap();
+            // let rt = tokio::runtime::Builder::new_current_thread()
+            //     .enable_all()
+            //     .build()
+            //     .unwrap();
+            // rt.spawn(async move {
+            //     loop {
+            //         tokio::time::sleep(Duration::from_millis(100)).await;
+            //         info!("tokio runtime is live");
+            //     }
+            // });
+            Box::new(match mode {
+                TokioRioModeKind::SingleGlobal => EngineTokioRio {
+                    rt,
+                    mode: TokioRioMode::SingleGlobal(Arc::new(rio::new().unwrap())),
+                },
+                TokioRioModeKind::ExecutorThreadLocal => EngineTokioRio {
+                    rt,
+                    mode: TokioRioMode::ExecutorThreadLocal,
+                },
+                TokioRioModeKind::Epoll => {
+                    let (rio, reaper) = rio::Config::default().start(true).unwrap();
+                    let reaper = reaper.unwrap();
+                    EngineTokioRio {
+                        rt,
+                        mode: TokioRioMode::Epoll {
+                            rio: Arc::new(rio),
+                            reaper: Some(reaper),
+                        },
+                    }
+                }
+            })
+        }
     }
 }
 
@@ -377,21 +446,21 @@ fn open_file_direct_io(
         file
     }
 }
-
 impl Engine for EngineStd {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) {
+        let myself = Arc::new(*self);
         std::thread::scope(|scope| {
             assert_eq!(works.len(), args.num_clients.get() as usize);
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
-                let myself = Arc::clone(&self);
+                let myself = Arc::clone(&myself);
                 scope.spawn(move || myself.client(i, &args, work, &stop, stats_state));
             }
         });
@@ -467,7 +536,7 @@ struct EngineTokioOnExecutorThread {
 
 impl Engine for EngineTokioOnExecutorThread {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
@@ -559,7 +628,7 @@ impl EngineTokioOnExecutorThread {
 
 impl Engine for EngineTokioSpawnBlocking {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
@@ -685,15 +754,16 @@ struct EngineTokioFlume {
 
 impl Engine for EngineTokioFlume {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) {
-        let (worker_tx, work_rx) = flume::bounded(self.queue_depth.get() as usize);
+        let myself = Arc::new(*self);
+        let (worker_tx, work_rx) = flume::bounded(myself.queue_depth.get() as usize);
         let mut handles = Vec::new();
-        for _ in 0..self.num_workers.get() {
+        for _ in 0..myself.num_workers.get() {
             let work_rx = work_rx.clone();
             let handle = std::thread::spawn(move || Self::worker(work_rx));
             handles.push(handle);
@@ -702,14 +772,13 @@ impl Engine for EngineTokioFlume {
         scopeguard::defer!(for handle in handles {
             handle.join().unwrap();
         });
-        let rt = &self.rt;
-        rt.block_on(async {
+        myself.rt.block_on(async {
             let mut handles = Vec::new();
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let worker_tx = worker_tx.clone();
-                let myself = Arc::clone(&self);
+                let myself = Arc::clone(&myself);
                 handles.push(tokio::spawn(async move {
                     myself
                         .client(worker_tx, i, &args, work, &stop, stats_state)
@@ -864,20 +933,72 @@ thread_local! {
 
 impl Engine for EngineTokioRio {
     fn run(
-        self: Arc<Self>,
+        self: Box<Self>,
         args: &'static Args,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) {
-        self.rt.block_on(async {
+        let EngineTokioRio { rt, mode } = *self;
+        let mode = match mode {
+            TokioRioMode::Epoll { mut reaper, rio } => {
+                let mut reaper = reaper.take().unwrap();
+                let eventfd = eventfd::EventFD::new(0, eventfd::EfdFlags::EFD_NONBLOCK).unwrap();
+                rio.register_eventfd_async(eventfd.as_raw_fd()).unwrap(); // TODO lifetime of the fd!
+                let stats_state = Arc::clone(&stats_state);
+                rt.spawn(tokio::task::unconstrained(async move {
+                    let fd = tokio::io::unix::AsyncFd::new(eventfd).unwrap();
+                    loop {
+                        // info!("Reaper waiting for eventfd");
+                        let mut guard = fd.ready(tokio::io::Interest::READABLE).await.unwrap();
+                        assert!(guard.ready().is_readable());
+                        loop {
+                            match fd.get_ref().read() {
+                                Ok(val) => {
+                                    assert!(val > 0);
+                                    // info!("read: {val:?}");
+                                    continue;
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // info!("would block");
+                                    guard.clear_ready_matching(tokio::io::Ready::READABLE);
+                                    break;
+                                }
+                                Err(e) => panic!("{:?}", e),
+                            }
+                        }
+                        drop(guard);
+                        stats_state
+                            .tokio_rio_epoll_iterations
+                            .fetch_add(1, Ordering::Relaxed);
+
+                        // info!("Reaper one iter");
+                        match reaper.poll() {
+                            std::ops::ControlFlow::Continue(count) => {
+                                // info!("Reaper poll got count {}", count);
+                                continue;
+                            }
+                            std::ops::ControlFlow::Break(()) => {
+                                info!("Reaper stopping, poison pill");
+                                break;
+                            }
+                        }
+                    }
+                }));
+
+                TokioRioModeReduced::Epoll(rio)
+            }
+            TokioRioMode::SingleGlobal(rio) => TokioRioModeReduced::SingleGlobal(rio),
+            TokioRioMode::ExecutorThreadLocal => TokioRioModeReduced::ExecutorThreadLocal,
+        };
+        rt.block_on(async move {
             let mut handles = Vec::new();
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
-                let myself = Arc::clone(&self);
+                let mode = mode.clone();
                 handles.push(tokio::spawn(async move {
-                    myself.client(i, &args, work, &stop, stats_state).await
+                    Self::client(mode, i, &args, work, &stop, stats_state).await
                 }));
             }
             for handle in handles {
@@ -889,14 +1010,15 @@ impl Engine for EngineTokioRio {
 
 impl EngineTokioRio {
     async fn client(
-        &self,
+        mode: TokioRioModeReduced,
         i: u64,
         args: &Args,
         work: ClientWork,
         stop: &AtomicBool,
         stats_state: Arc<StatsState>,
     ) {
-        tracing::info!("Client {i} starting");
+        // tokio::time::sleep(Duration::from_secs(i)).await;
+        // tracing::info!("Client {i} starting");
         let block_size = 1 << args.block_size_shift.get();
 
         let rwlock = Arc::new(tokio::sync::RwLock::new(()));
@@ -957,7 +1079,13 @@ impl EngineTokioRio {
                     // wakes up the task but we don't know which runtime it is one.
                     // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
                     //  affine to a completion queue somehow... The design space is big.)
-                    let rio = RIO_THREAD_LOCAL_RING.with(|rio| Arc::clone(&*rio.borrow()));
+                    let rio = match &mode {
+                        TokioRioModeReduced::SingleGlobal(rio) => rio.clone(),
+                        TokioRioModeReduced::ExecutorThreadLocal => {
+                            RIO_THREAD_LOCAL_RING.with(|ring| ring.borrow().clone())
+                        }
+                        TokioRioModeReduced::Epoll(rio) => rio.clone(),
+                    };
                     let count = rio.read_at(&file, &mut buf, offset_in_file).await.unwrap();
                     assert_eq!(count, buf.len());
                     file.into_raw_fd(); // so that it's there for next iteration
