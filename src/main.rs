@@ -1293,9 +1293,52 @@ impl Engine for EngineTokioIoUringEventfdBridge {
                     Self::client(i, &args, work, &stop, stats_state).await
                 }));
             }
-            for handle in handles {
+            // task that prints periodically which clients have exited
+            let stopped_handles = Arc::new(
+                (0..handles.len())
+                    .map(|_| AtomicBool::new(false))
+                    .collect::<Vec<_>>(),
+            );
+            let stop_stopped_task_status_task = Arc::new(AtomicBool::new(false));
+            let stopped_task_status_task = tokio::spawn({
+                let stopped_handles = Arc::clone(&stopped_handles);
+                let stop_clients = Arc::clone(&stop);
+                let stop_stopped_task_status_task = Arc::clone(&stop_stopped_task_status_task);
+                async move {
+                    // don't print until `stop` is set
+                    while !stop_clients.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                        info!("waiting for clients to stop");
+                    }
+                    while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
+                        // log list of not-stopped clients every second
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let stopped = stopped_handles
+                            .iter()
+                            .map(|x| x.load(Ordering::Relaxed))
+                            .filter(|x| *x)
+                            .count();
+                        let not_stopped = stopped_handles
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, state)| state.load(Ordering::Relaxed) == false)
+                            .map(|(i, _)| i)
+                            .collect::<Vec<usize>>();
+                        let total = stopped_handles.len();
+                        info!("handles stopped {stopped} total {total}");
+                        info!("  not stopped: {not_stopped:?}",)
+                    }
+                }
+            });
+            for (i, handle) in handles.into_iter().enumerate() {
+                info!("awaiting client {i}");
                 handle.await.unwrap();
+                stopped_handles[i].store(true, Ordering::Relaxed);
             }
+            stop_stopped_task_status_task.store(true, Ordering::Relaxed);
+            info!("awaiting stopped_task_status_task");
+            stopped_task_status_task.await.unwrap();
+            info!("stopped_task_status_task stopped");
         });
     }
 }
