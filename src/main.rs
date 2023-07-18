@@ -15,6 +15,7 @@ use std::{
 };
 
 use clap::Parser;
+use crossbeam_utils::CachePadded;
 use rand::{Rng, RngCore};
 use tracing::{error, info};
 
@@ -143,7 +144,7 @@ struct EngineTokioSpawnBlocking {
 }
 
 struct StatsState {
-    reads_in_last_second: AtomicU64,
+    reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
     client0_latency_sample: AtomicU64,
     tokio_rio_epoll_iterations: AtomicU64,
 }
@@ -172,7 +173,10 @@ fn main() {
     let engine = setup_engine(&args.work_kind.engine());
 
     let stats_state = Arc::new(StatsState {
-        reads_in_last_second: AtomicU64::new(0),
+        reads_in_last_second: (0..works.len())
+            .into_iter()
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect(),
         client0_latency_sample: AtomicU64::new(0),
         tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
@@ -195,8 +199,13 @@ fn main() {
         move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let reads_in_last_second =
-                    stats_state.reads_in_last_second.swap(0, Ordering::Relaxed);
+                let mut reads_in_last_second = 0;
+                for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
+                    let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
+                    let per_task = per_task_total_reads.entry(client).or_insert(0);
+                    *per_task += task_reads_in_last_second;
+                    reads_in_last_second += task_reads_in_last_second;
+                }
                 let client0_latency_sample = stats_state
                     .client0_latency_sample
                     .swap(0, Ordering::Relaxed);
@@ -534,8 +543,7 @@ impl EngineStd {
                 }
                 ClientWork::NoWork {} => {}
             }
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             if i == 0 {
                 stats_state
@@ -643,8 +651,7 @@ impl EngineTokioOnExecutorThread {
                 }
                 ClientWork::NoWork {} => {}
             }
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             // if i == 0 {
             // info!("Client {i} read took {:?}", start.elapsed());
@@ -764,8 +771,7 @@ impl EngineTokioSpawnBlocking {
             })
             .await
             .unwrap();
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             if i == 0 {
                 stats_state
@@ -927,8 +933,7 @@ impl EngineTokioFlume {
                 .await
                 .expect("rx flume")
                 .expect("not expecting io errors");
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             if i == 0 {
                 stats_state
@@ -1252,8 +1257,7 @@ impl EngineTokioRio {
             }
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
 
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             if i == 0 {
                 stats_state
@@ -1373,8 +1377,7 @@ impl EngineTokioIoUringEventfdBridge {
             }
             // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
 
-            stats_state
-                .reads_in_last_second
+            stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             if i == 0 {
                 stats_state

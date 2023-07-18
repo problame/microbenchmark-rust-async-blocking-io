@@ -21,6 +21,7 @@ tokio = { version = "1.29.1", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
 tokio-io_uring-eventfd-bridge = { path = "/home/cs/src/tokio-io_uring-eventfd-bridge"}
+crossbeam-utils = "0.8.16"
 
 [patch.crates-io]
 # tokio = { git = "https://github.com/problame/tokio.git", branch="problame/distinguish-core-and-worker-by-thread-name--1.29.1" }
