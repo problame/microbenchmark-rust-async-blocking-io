@@ -1,5 +1,6 @@
 use std::{
     alloc::Layout,
+    collections::HashMap,
     io::{Seek, Write},
     num::NonZeroU64,
     os::{
@@ -16,6 +17,7 @@ use std::{
 
 use clap::Parser;
 use crossbeam_utils::CachePadded;
+use itertools::Itertools;
 use rand::{Rng, RngCore};
 use tracing::{error, info};
 
@@ -197,6 +199,8 @@ fn main() {
         let stats_state = Arc::clone(&stats_state);
 
         move || {
+            let mut per_task_total_reads = HashMap::new();
+
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let mut reads_in_last_second = 0;
@@ -233,6 +237,23 @@ fn main() {
                     _ => {}
                 }
             }
+
+            // dump per-task total reads into a json file.
+            // Useful to judge fairness (i.e., did each client task get about the same nubmer of ops in a time-based run).
+            //
+            // command line to get something for copy-paste into google sheets:
+            //  ssh neon-devvm-mbp ssh testinstance sudo cat /mnt/per_task_total_reads.json | jq '.[]' | pbcopy
+            let sorted_per_task_total_reads = per_task_total_reads
+                .values()
+                .cloned()
+                .sorted()
+                .map(|v| v as f64)
+                .collect::<Vec<f64>>();
+            std::fs::write(
+                "per_task_total_reads.json",
+                serde_json::to_string(&sorted_per_task_total_reads).unwrap(),
+            )
+            .unwrap();
         }
     });
 
