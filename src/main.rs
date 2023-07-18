@@ -1344,6 +1344,7 @@ impl Engine for EngineTokioIoUringEventfdBridge {
 }
 
 impl EngineTokioIoUringEventfdBridge {
+    #[tracing::instrument(skip_all, level="trace", fields(client=%i))]
     async fn client(
         i: u64,
         args: &Args,
