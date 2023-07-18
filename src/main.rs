@@ -93,6 +93,7 @@ enum EngineKind {
     TokioRio {
         mode: TokioRioModeKind,
     },
+    TokioIoUringEventfdBridge,
 }
 
 struct EngineStd {}
@@ -412,6 +413,13 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
                     mode: TokioRioMode::EpollExecutorThreadLocal,
                 },
             })
+        }
+        EngineKind::TokioIoUringEventfdBridge => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            Box::new(EngineTokioIoUringEventfdBridge { rt })
         }
     }
 }
@@ -1235,6 +1243,127 @@ impl EngineTokioRio {
                     };
                     let count = rio.read_at(&file, &mut buf, offset_in_file).await.unwrap();
                     assert_eq!(count, buf.len());
+                    file.into_raw_fd(); // so that it's there for next iteration
+                }
+                ClientWorkFd::TimerFd(_timerfd, _duration) => {
+                    unimplemented!()
+                }
+                ClientWorkFd::NoWork => (),
+            }
+            // TODO: can this dealock with rendezvous channel, i.e., queue_depth=0?
+
+            stats_state
+                .reads_in_last_second
+                .fetch_add(1, Ordering::Relaxed);
+            if i == 0 {
+                stats_state
+                    .client0_latency_sample
+                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        info!("Client {i} stopping");
+    }
+}
+
+struct EngineTokioIoUringEventfdBridge {
+    rt: tokio::runtime::Runtime,
+}
+
+impl Engine for EngineTokioIoUringEventfdBridge {
+    fn run(
+        self: Box<Self>,
+        args: &'static Args,
+        works: Vec<ClientWork>,
+        stop: Arc<AtomicBool>,
+        stats_state: Arc<StatsState>,
+    ) {
+        let EngineTokioIoUringEventfdBridge { rt } = *self;
+        let rt = Arc::new(rt);
+
+        rt.block_on(async move {
+            let mut handles = Vec::new();
+            for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
+                let stop = Arc::clone(&stop);
+                let stats_state = Arc::clone(&stats_state);
+                handles.push(tokio::spawn(async move {
+                    Self::client(i, &args, work, &stop, stats_state).await
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+    }
+}
+
+impl EngineTokioIoUringEventfdBridge {
+    async fn client(
+        i: u64,
+        args: &Args,
+        work: ClientWork,
+        stop: &AtomicBool,
+        stats_state: Arc<StatsState>,
+    ) {
+        // tokio::time::sleep(Duration::from_secs(i)).await;
+        // tracing::info!("Client {i} starting");
+        let block_size = 1 << args.block_size_shift.get();
+
+        let rwlock = Arc::new(tokio::sync::RwLock::new(()));
+        std::mem::forget(Arc::clone(&rwlock));
+
+        #[derive(Copy, Clone)]
+        enum ClientWorkFd {
+            DiskAccess(RawFd),
+            TimerFd(RawFd, Duration),
+            NoWork,
+        }
+
+        let fd = match work {
+            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+                let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
+                std::mem::forget(timerfd); // they don't support into_raw_fd
+                ret
+            }
+            ClientWork::NoWork {} => ClientWorkFd::NoWork,
+        };
+
+        // alloc aligned to make O_DIRECT work
+        let buf = unsafe {
+            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+            assert!(!ptr.is_null());
+            Vec::from_raw_parts(ptr, 0, block_size)
+        };
+        let mut loop_buf = Some(buf);
+        let block_size_u64: u64 = block_size.try_into().unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            // simulate Timeline::layers.read().await
+            let _guard = rwlock.read().await;
+
+            // find a random aligned 8k offset inside the file
+            debug_assert!(1024 * 1024 % block_size == 0);
+            let offset_in_file = rand::thread_rng()
+                .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
+                * block_size_u64;
+
+            let start = std::time::Instant::now();
+            match fd {
+                ClientWorkFd::DiskAccess(file_fd) => {
+                    let owned_buf = loop_buf.take().unwrap();
+                    let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
+                    // We use it to get one io_uring submission & completion ring per core / executor thread.
+                    // The thread-local rings are not great if there's block_in_place in the codebase. It's fine here.
+                    // Ideally we'd have one submission ring per core and a single completion ring, because, completion
+                    // wakes up the task but we don't know which runtime it is one.
+                    // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
+                    //  affine to a completion queue somehow... The design space is big.)
+
+                    let (file, owned_buf, res) =
+                        tokio_io_uring_eventfd_bridge::preadv(file, offset_in_file, owned_buf)
+                            .await;
+                    let count = res.unwrap();
+                    assert_eq!(count, owned_buf.len());
+                    loop_buf = Some(owned_buf);
                     file.into_raw_fd(); // so that it's there for next iteration
                 }
                 ClientWorkFd::TimerFd(_timerfd, _duration) => {
