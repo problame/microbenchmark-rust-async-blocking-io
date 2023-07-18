@@ -162,10 +162,11 @@ trait Engine {
 }
 
 fn main() {
-    std::env::set_var("RUST_LOG", "info");
-
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter({
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .expect("must set RUST_LOG variable")
+        })
         .init();
 
     let args: &'static Args = Box::leak(Box::new(Args::parse()));
