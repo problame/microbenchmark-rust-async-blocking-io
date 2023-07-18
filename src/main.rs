@@ -164,7 +164,9 @@ trait Engine {
 fn main() {
     std::env::set_var("RUST_LOG", "info");
 
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .init();
 
     let args: &'static Args = Box::leak(Box::new(Args::parse()));
 
