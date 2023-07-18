@@ -169,7 +169,6 @@ fn main() {
     let args: &'static Args = Box::leak(Box::new(Args::parse()));
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_monitor = Arc::new(AtomicBool::new(false));
 
     let works = setup_client_works(&args);
 
@@ -186,27 +185,23 @@ fn main() {
 
     ctrlc::set_handler({
         let stop = Arc::clone(&stop);
-        let stop_monitor = Arc::clone(&stop_monitor);
         move || {
             if stop.fetch_or(true, Ordering::Relaxed) {
-                error!("Received second SIGINT, stopping monitor");
-                if stop_monitor.fetch_or(true, Ordering::Relaxed) {
-                    error!("Received third SIGINT, aborting");
-                    std::process::abort();
-                }
+                error!("Received second SIGINT, aborting");
+                std::process::abort();
             }
         }
     })
     .unwrap();
 
     let monitor = std::thread::spawn({
-        let stop_monitor = Arc::clone(&stop_monitor);
+        let stop = Arc::clone(&stop);
         let stats_state = Arc::clone(&stats_state);
 
         move || {
             let mut per_task_total_reads = HashMap::new();
 
-            while !stop_monitor.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let mut reads_in_last_second = 0;
                 for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
