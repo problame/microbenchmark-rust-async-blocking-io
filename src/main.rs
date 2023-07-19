@@ -156,7 +156,7 @@ struct EngineTokioSpawnBlocking {
 
 struct StatsState {
     reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
-    latencies: crossbeam_utils::CachePadded<Mutex<incr_stats::incr::Stats>>,
+    latencies_histo: Vec<crossbeam_utils::CachePadded<Mutex<hdrhistogram::Histogram<u64>>>>,
     client0_latency_sample: AtomicU64,
     tokio_rio_epoll_iterations: AtomicU64,
 }
@@ -172,6 +172,10 @@ trait Engine {
 }
 
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
+
+fn make_histogram() -> hdrhistogram::Histogram<u64> {
+    hdrhistogram::Histogram::new_with_bounds(1, 10_000_000, 3).unwrap()
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -194,7 +198,10 @@ fn main() {
             .into_iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect(),
-        latencies: CachePadded::new(Mutex::new(incr_stats::incr::Stats::new())),
+        latencies_histo: (0..works.len())
+            .into_iter()
+            .map(|_| CachePadded::new(Mutex::new(make_histogram())))
+            .collect(),
         client0_latency_sample: AtomicU64::new(0),
         tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
@@ -210,83 +217,89 @@ fn main() {
     })
     .unwrap();
 
-    let monitor = std::thread::spawn({
-        let stop = Arc::clone(&stop);
-        let stats_state = Arc::clone(&stats_state);
+    let monitor = std::thread::Builder::new()
+        .name("monitor".to_owned())
+        .spawn({
+            let stop = Arc::clone(&stop);
+            let stats_state = Arc::clone(&stats_state);
 
-        move || {
-            let mut per_task_total_reads = HashMap::new();
+            move || {
+                let mut per_task_total_reads = HashMap::new();
 
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(MONITOR_PERIOD);
-                let mut reads_in_last_second = 0;
-                for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
-                    let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
-                    let per_task = per_task_total_reads.entry(client).or_insert(0);
-                    *per_task += task_reads_in_last_second;
-                    reads_in_last_second += task_reads_in_last_second;
-                }
-                let client0_latency_sample = stats_state
-                    .client0_latency_sample
-                    .swap(0, Ordering::Relaxed);
-                let tokio_rio_epoll_iterations = stats_state
-                    .tokio_rio_epoll_iterations
-                    .swap(0, Ordering::Relaxed);
-                info!(
-                    "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
-                    reads_in_last_second,
-                    client0_latency_sample,
-                    (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
-                );
-                let mut latencies = stats_state.latencies.lock().unwrap();
-                // ignore printing errors
-                let _ = (|| {
+                let mut histo = make_histogram();
+
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(MONITOR_PERIOD);
+                    let mut reads_in_last_second = 0;
+                    for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
+                        let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
+                        let per_task = per_task_total_reads.entry(client).or_insert(0);
+                        *per_task += task_reads_in_last_second;
+                        reads_in_last_second += task_reads_in_last_second;
+                    }
+                    let client0_latency_sample = stats_state
+                        .client0_latency_sample
+                        .swap(0, Ordering::Relaxed);
+                    let tokio_rio_epoll_iterations = stats_state
+                        .tokio_rio_epoll_iterations
+                        .swap(0, Ordering::Relaxed);
                     info!(
-                        "Latency stats: min={} max={} mean={} sample_variance={}",
-                        latencies.min()?,
-                        latencies.max()?,
-                        latencies.mean()?,
-                        latencies.sample_variance()?,
+                        "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
+                        reads_in_last_second,
+                        client0_latency_sample,
+                        (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                     );
-                    anyhow::Ok(())
-                })();
-                *latencies = incr_stats::incr::Stats::new(); // reset for next iteration
-                drop(latencies);
 
-                match args.work_kind.engine() {
-                    EngineKind::TokioRio { mode } => match mode {
-                        TokioRioModeKind::Epoll | TokioRioModeKind::EpollExecutorThreadLocal => {
-                            if tokio_rio_epoll_iterations < 10 {
-                                tracing::warn!(
-                                    "Tokio RIO epoll iterations {}",
-                                    tokio_rio_epoll_iterations
-                                );
+                    for h in &stats_state.latencies_histo {
+                        let mut h = h.lock().unwrap();
+                        histo += &*h;
+                        h.clear();
+                    }
+                    info!(
+                    "Latency histogram (not resetting): p50={}, p90={}, p99={}, p999={} p9999={}",
+                    histo.value_at_percentile(50.0),
+                    histo.value_at_percentile(90.0),
+                    histo.value_at_percentile(99.0),
+                    histo.value_at_percentile(99.9),
+                    histo.value_at_percentile(99.99),
+                );
+
+                    match args.work_kind.engine() {
+                        EngineKind::TokioRio { mode } => match mode {
+                            TokioRioModeKind::Epoll
+                            | TokioRioModeKind::EpollExecutorThreadLocal => {
+                                if tokio_rio_epoll_iterations < 10 {
+                                    tracing::warn!(
+                                        "Tokio RIO epoll iterations {}",
+                                        tokio_rio_epoll_iterations
+                                    );
+                                }
                             }
-                        }
+                            _ => {}
+                        },
                         _ => {}
-                    },
-                    _ => {}
+                    }
                 }
-            }
 
-            // dump per-task total reads into a json file.
-            // Useful to judge fairness (i.e., did each client task get about the same nubmer of ops in a time-based run).
-            //
-            // command line to get something for copy-paste into google sheets:
-            //  ssh neon-devvm-mbp ssh testinstance sudo cat /mnt/per_task_total_reads.json | jq '.[]' | pbcopy
-            let sorted_per_task_total_reads = per_task_total_reads
-                .values()
-                .cloned()
-                .sorted()
-                .map(|v| v as f64)
-                .collect::<Vec<f64>>();
-            std::fs::write(
-                "per_task_total_reads.json",
-                serde_json::to_string(&sorted_per_task_total_reads).unwrap(),
-            )
-            .unwrap();
-        }
-    });
+                // dump per-task total reads into a json file.
+                // Useful to judge fairness (i.e., did each client task get about the same nubmer of ops in a time-based run).
+                //
+                // command line to get something for copy-paste into google sheets:
+                //  ssh neon-devvm-mbp ssh testinstance sudo cat /mnt/per_task_total_reads.json | jq '.[]' | pbcopy
+                let sorted_per_task_total_reads = per_task_total_reads
+                    .values()
+                    .cloned()
+                    .sorted()
+                    .map(|v| v as f64)
+                    .collect::<Vec<f64>>();
+                std::fs::write(
+                    "per_task_total_reads.json",
+                    serde_json::to_string(&sorted_per_task_total_reads).unwrap(),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
 
     engine.run(&args, works, stop, stats_state);
     monitor.join().unwrap();
@@ -1551,15 +1564,14 @@ impl EngineTokioIoUringEventfdBridge {
                 .fetch_add(1, Ordering::Relaxed);
 
             let now = Instant::now();
-            if now.duration_since(*latencies_batch_last_flush.get_or_insert(now))
-                > MONITOR_PERIOD.div_f64(3.0)
-            {
-                stats_state
-                    .latencies
-                    .lock()
-                    .unwrap()
-                    .array_update(&latencies_batch)
-                    .unwrap();
+            if now.duration_since(*latencies_batch_last_flush.get_or_insert(now)) > MONITOR_PERIOD {
+                for lat in &latencies_batch {
+                    stats_state.latencies_histo[usize::try_from(i).unwrap()]
+                        .lock()
+                        .unwrap()
+                        .record(*lat as u64)
+                        .unwrap()
+                }
                 latencies_batch.clear();
                 latencies_batch_last_flush = Some(now);
             }
