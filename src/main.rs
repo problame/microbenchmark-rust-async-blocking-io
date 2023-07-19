@@ -19,7 +19,7 @@ use clap::Parser;
 use crossbeam_utils::CachePadded;
 use itertools::Itertools;
 use rand::{Rng, RngCore};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[derive(clap::Parser)]
 struct Args {
@@ -157,7 +157,6 @@ struct EngineTokioSpawnBlocking {
 struct StatsState {
     reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
     latencies_histo: Vec<crossbeam_utils::CachePadded<Mutex<hdrhistogram::Histogram<u64>>>>,
-    client0_latency_sample: AtomicU64,
     tokio_rio_epoll_iterations: AtomicU64,
 }
 
@@ -194,7 +193,8 @@ fn main() {
 
     let args: &'static Args = Box::leak(Box::new(Args::parse()));
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop_engine = Arc::new(AtomicBool::new(false));
+    let engine_stopped = Arc::new(AtomicBool::new(false));
 
     let works = setup_client_works(&args);
 
@@ -209,14 +209,13 @@ fn main() {
             .into_iter()
             .map(|_| CachePadded::new(Mutex::new(StatsState::make_latency_histogram())))
             .collect(),
-        client0_latency_sample: AtomicU64::new(0),
         tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
 
     ctrlc::set_handler({
-        let stop = Arc::clone(&stop);
+        let stop_engine = Arc::clone(&stop_engine);
         move || {
-            if stop.fetch_or(true, Ordering::Relaxed) {
+            if stop_engine.fetch_or(true, Ordering::Relaxed) {
                 error!("Received second SIGINT, aborting");
                 std::process::abort();
             }
@@ -227,55 +226,86 @@ fn main() {
     let monitor = std::thread::Builder::new()
         .name("monitor".to_owned())
         .spawn({
-            let stop = Arc::clone(&stop);
+            let engine_stopped = Arc::clone(&engine_stopped);
             let stats_state = Arc::clone(&stats_state);
 
             move || {
                 let mut per_task_total_reads = HashMap::new();
 
-                // allocate once outside the loop
-                let mut histo = StatsState::make_latency_histogram();
+                struct AggregatedStats {
+                    what: String,
+                    start: std::time::Instant,
+                    op_count: u64,
+                    op_size: u64,
+                    latencies_histo: hdrhistogram::Histogram<u64>,
+                }
+                impl AggregatedStats {
+                    fn new(what: String, op_size: u64) -> Self {
+                        Self {
+                            what,
+                            start: std::time::Instant::now(),
+                            op_count: 0,
+                            op_size,
+                            latencies_histo: StatsState::make_latency_histogram(),
+                        }
+                    }
+                    fn reset(&mut self, start: std::time::Instant) {
+                        self.start = start;
+                        self.op_count = 0;
+                        self.latencies_histo.clear();
+                    }
+                    fn print_avg_since_start_stats(&self) {
+                        let histo = &self.latencies_histo;
+                        let total_reads = self.op_count;
+                        let delta_t = self.start.elapsed().as_secs_f64();
+                        info!(
+                            "{}: avg over {:.2}s: IOPS={} TP={:.2} p50={}, p90={}, p99={}, p999={} p9999={}",
+                            self.what,
+                            delta_t,
+                            (total_reads as f64) / delta_t,
+                            (total_reads as f64) * ((self.op_size) as f64)
+                                / ((1 << 20) as f64)
+                                / delta_t,
+                            histo.value_at_percentile(50.0),
+                            histo.value_at_percentile(90.0),
+                            histo.value_at_percentile(99.0),
+                            histo.value_at_percentile(99.9),
+                            histo.value_at_percentile(99.99),
+                        );
+                    }
+                }
 
-                while !stop.load(Ordering::Relaxed) {
+                let op_size = 1 << args.block_size_shift.get();
+                let mut totals = AggregatedStats::new("since start".to_owned(), op_size);
+                let mut this_round = AggregatedStats::new("since last".to_owned(), op_size);
+                while !engine_stopped.load(Ordering::Relaxed) {
+                    this_round.reset(std::time::Instant::now());
                     std::thread::sleep(MONITOR_PERIOD);
-                    let mut reads_in_last_second = 0;
                     for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
                         let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
                         let per_task = per_task_total_reads.entry(client).or_insert(0);
                         *per_task += task_reads_in_last_second;
-                        reads_in_last_second += task_reads_in_last_second;
+                        this_round.op_count += task_reads_in_last_second;
+                        totals.op_count += task_reads_in_last_second;
                     }
-                    let client0_latency_sample = stats_state
-                        .client0_latency_sample
-                        .swap(0, Ordering::Relaxed);
-                    let tokio_rio_epoll_iterations = stats_state
-                        .tokio_rio_epoll_iterations
-                        .swap(0, Ordering::Relaxed);
-                    info!(
-                        "IOPS {} LatClient0 {}us BANDWIDTH {} MiB/s",
-                        reads_in_last_second,
-                        client0_latency_sample,
-                        (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
-                    );
-
                     for h in &stats_state.latencies_histo {
                         let mut h = h.lock().unwrap();
-                        histo += &*h;
+                        totals.latencies_histo += &*h;
+                        this_round.latencies_histo += &*h;
                         h.clear();
                     }
-                    info!(
-                    "Latency histogram (not resetting): p50={}, p90={}, p99={}, p999={} p9999={}",
-                    histo.value_at_percentile(50.0),
-                    histo.value_at_percentile(90.0),
-                    histo.value_at_percentile(99.0),
-                    histo.value_at_percentile(99.9),
-                    histo.value_at_percentile(99.99),
-                );
+
+                   this_round.print_avg_since_start_stats();
+                   totals.print_avg_since_start_stats();
 
                     match args.work_kind.engine() {
                         EngineKind::TokioRio { mode } => match mode {
                             TokioRioModeKind::Epoll
                             | TokioRioModeKind::EpollExecutorThreadLocal => {
+                                let tokio_rio_epoll_iterations = stats_state
+                                    .tokio_rio_epoll_iterations
+                                    .swap(0, Ordering::Relaxed);
+
                                 if tokio_rio_epoll_iterations < 10 {
                                     tracing::warn!(
                                         "Tokio RIO epoll iterations {}",
@@ -289,6 +319,8 @@ fn main() {
                     }
                 }
 
+                info!("monitor shutting down");
+
                 // dump per-task total reads into a json file.
                 // Useful to judge fairness (i.e., did each client task get about the same nubmer of ops in a time-based run).
                 //
@@ -300,16 +332,22 @@ fn main() {
                     .sorted()
                     .map(|v| v as f64)
                     .collect::<Vec<f64>>();
+                let outpath = std::path::PathBuf::from("per_task_total_reads.json");
+                info!("writing per-task total read count to {:?}", outpath);
                 std::fs::write(
-                    "per_task_total_reads.json",
+                    &outpath,
                     serde_json::to_string(&sorted_per_task_total_reads).unwrap(),
                 )
                 .unwrap();
+
+                totals.print_avg_since_start_stats();
+
             }
         })
         .unwrap();
 
-    engine.run(&args, works, stop, stats_state);
+    engine.run(&args, works, stop_engine, stats_state);
+    engine_stopped.store(true, Ordering::Relaxed);
     monitor.join().unwrap();
 }
 
@@ -632,11 +670,6 @@ impl EngineStd {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            if i == 0 {
-                stats_state
-                    .client0_latency_sample
-                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
         }
         info!("Client {i} stopping");
     }
@@ -744,12 +777,6 @@ impl EngineTokioOnExecutorThread {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            // if i == 0 {
-            // info!("Client {i} read took {:?}", start.elapsed());
-            stats_state
-                .client0_latency_sample
-                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            // }
         }
         info!("Client {i} stopping");
     }
@@ -874,11 +901,6 @@ impl EngineTokioSpawnBlocking {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            if i == 0 {
-                stats_state
-                    .client0_latency_sample
-                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
         }
         info!("Client {i} stopping");
     }
@@ -1046,11 +1068,6 @@ impl EngineTokioFlume {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            if i == 0 {
-                stats_state
-                    .client0_latency_sample
-                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
         }
         info!("Client {i} stopping");
     }
@@ -1380,11 +1397,6 @@ impl EngineTokioRio {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            if i == 0 {
-                stats_state
-                    .client0_latency_sample
-                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
         }
         info!("Client {i} stopping");
     }
@@ -1429,7 +1441,7 @@ impl Engine for EngineTokioIoUringEventfdBridge {
                     // don't print until `stop` is set
                     while !stop_clients.load(Ordering::Relaxed) {
                         tokio::time::sleep(Duration::from_millis(1000)).await;
-                        info!("waiting for clients to stop");
+                        debug!("waiting for clients to stop");
                     }
                     while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
                         // log list of not-stopped clients every second
@@ -1573,11 +1585,6 @@ impl EngineTokioIoUringEventfdBridge {
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
             stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
-            if i == 0 {
-                stats_state
-                    .client0_latency_sample
-                    .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
         }
         info!("Client {i} stopping");
     }
