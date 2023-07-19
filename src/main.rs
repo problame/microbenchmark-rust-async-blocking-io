@@ -30,9 +30,16 @@ struct Args {
     work_kind: WorkKind,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ValidateMode {
+    NoValidate,
+    Validate,
+}
+
 #[derive(Clone, Copy, clap::Subcommand)]
 enum WorkKind {
     DiskAccess {
+        validate: ValidateMode,
         #[clap(subcommand)]
         disk_access_kind: DiskAccessKind,
     },
@@ -61,7 +68,9 @@ impl WorkKind {
             WorkKind::TimerFd { expiration_mode } => match expiration_mode {
                 TimerFdExperiationModeKind::Oneshot { engine, .. } => engine,
             },
-            WorkKind::DiskAccess { disk_access_kind } => match disk_access_kind {
+            WorkKind::DiskAccess {
+                disk_access_kind, ..
+            } => match disk_access_kind {
                 DiskAccessKind::DirectIo { engine } => engine,
                 DiskAccessKind::CachedIo { engine } => engine,
             },
@@ -267,6 +276,7 @@ fn main() {
 enum ClientWork {
     DiskAccess {
         file: std::fs::File,
+        validate: bool,
     },
     TimerFdSetStateAndRead {
         timerfd: timerfd::TimerFd,
@@ -277,7 +287,10 @@ enum ClientWork {
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
     match &args.work_kind {
-        WorkKind::DiskAccess { disk_access_kind } => {
+        WorkKind::DiskAccess {
+            disk_access_kind,
+            validate,
+        } => {
             setup_files(&args, disk_access_kind);
             // assert invariant and open files
             let mut client_files = Vec::new();
@@ -291,7 +304,13 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
                     OpenFileMode::Read,
                     &data_file_path(args, i),
                 );
-                client_files.push(ClientWork::DiskAccess { file });
+                client_files.push(ClientWork::DiskAccess {
+                    file,
+                    validate: match validate {
+                        ValidateMode::NoValidate => false,
+                        ValidateMode::Validate => true,
+                    },
+                });
             }
             client_files
         }
@@ -555,7 +574,10 @@ impl EngineStd {
                 * block_size;
             let start = std::time::Instant::now();
             match &mut work {
-                ClientWork::DiskAccess { file } => {
+                ClientWork::DiskAccess { file, validate } => {
+                    if *validate {
+                        unimplemented!()
+                    }
                     self.read_iter(i, args, file, offset_in_file, buf);
                 }
                 ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
@@ -663,7 +685,10 @@ impl EngineTokioOnExecutorThread {
                 * block_size_u64;
             let start = std::time::Instant::now();
             match &mut work {
-                ClientWork::DiskAccess { file } => {
+                ClientWork::DiskAccess { file, validate } => {
+                    if *validate {
+                        unimplemented!()
+                    }
                     file.read_at(buf, offset_in_file).unwrap();
                 }
                 ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
@@ -730,13 +755,16 @@ impl EngineTokioSpawnBlocking {
 
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
-            DiskAccess(RawFd),
+            DiskAccess { raw_fd: RawFd, validate: bool },
             TimerFd(RawFd, Duration),
             NoWork,
         }
 
         let fd = match work {
-            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+                raw_fd: file.into_raw_fd(),
+                validate,
+            },
             ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
@@ -772,7 +800,13 @@ impl EngineTokioSpawnBlocking {
             let start = std::time::Instant::now();
             tokio::task::spawn_blocking(move || {
                 match fd {
-                    ClientWorkFd::DiskAccess(file_fd) => {
+                    ClientWorkFd::DiskAccess {
+                        raw_fd: file_fd,
+                        validate,
+                    } => {
+                        if validate {
+                            unimplemented!()
+                        }
                         let buf = buf;
                         let buf: &mut [u8] =
                             unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
@@ -879,13 +913,16 @@ impl EngineTokioFlume {
 
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
-            DiskAccess(RawFd),
+            DiskAccess { raw_fd: RawFd, validate: bool },
             TimerFd(RawFd, Duration),
             NoWork,
         }
 
         let fd = match work {
-            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+                raw_fd: file.into_raw_fd(),
+                validate,
+            },
             ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
@@ -920,7 +957,13 @@ impl EngineTokioFlume {
                 * block_size_u64;
             let work = Box::new(move || {
                 match fd {
-                    ClientWorkFd::DiskAccess(file_fd) => {
+                    ClientWorkFd::DiskAccess {
+                        raw_fd: file_fd,
+                        validate,
+                    } => {
+                        if validate {
+                            unimplemented!()
+                        }
                         let buf = buf;
                         let buf: &mut [u8] =
                             unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
@@ -1165,13 +1208,16 @@ impl EngineTokioRio {
 
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
-            DiskAccess(RawFd),
+            DiskAccess { raw_fd: RawFd, validate: bool },
             TimerFd(RawFd, Duration),
             NoWork,
         }
 
         let fd = match work {
-            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+                raw_fd: file.into_raw_fd(),
+                validate,
+            },
             ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
@@ -1207,7 +1253,13 @@ impl EngineTokioRio {
 
             let start = std::time::Instant::now();
             match fd {
-                ClientWorkFd::DiskAccess(file_fd) => {
+                ClientWorkFd::DiskAccess {
+                    raw_fd: file_fd,
+                    validate,
+                } => {
+                    if validate {
+                        unimplemented!()
+                    }
                     let buf = buf;
                     let mut buf: &mut [u8] =
                         unsafe { std::slice::from_raw_parts_mut(buf.0, block_size) };
@@ -1385,13 +1437,16 @@ impl EngineTokioIoUringEventfdBridge {
 
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
-            DiskAccess(RawFd),
+            DiskAccess { raw_fd: RawFd, validate: bool },
             TimerFd(RawFd, Duration),
             NoWork,
         }
 
         let fd = match work {
-            ClientWork::DiskAccess { file } => ClientWorkFd::DiskAccess(file.into_raw_fd()),
+            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+                raw_fd: file.into_raw_fd(),
+                validate,
+            },
             ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
@@ -1407,6 +1462,14 @@ impl EngineTokioIoUringEventfdBridge {
             Vec::from_raw_parts(ptr, 0, block_size)
         };
         let mut loop_buf = Some(buf);
+
+        let validate_buf = unsafe {
+            let ptr = std::alloc::alloc(Layout::from_size_align(block_size, block_size).unwrap());
+            assert!(!ptr.is_null());
+            Vec::from_raw_parts(ptr, 0, block_size)
+        };
+        let mut loop_validate_buf = Some(validate_buf);
+
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
             // simulate Timeline::layers.read().await
@@ -1420,7 +1483,10 @@ impl EngineTokioIoUringEventfdBridge {
 
             let start = std::time::Instant::now();
             match fd {
-                ClientWorkFd::DiskAccess(file_fd) => {
+                ClientWorkFd::DiskAccess {
+                    raw_fd: file_fd,
+                    validate,
+                } => {
                     let owned_buf = loop_buf.take().unwrap();
                     let file = unsafe { OwnedFd::from_raw_fd(file_fd) };
                     // We use it to get one io_uring submission & completion ring per core / executor thread.
@@ -1435,6 +1501,20 @@ impl EngineTokioIoUringEventfdBridge {
                             .await;
                     let count = res.unwrap();
                     assert_eq!(count, owned_buf.len());
+                    assert_eq!(count, block_size);
+
+                    if validate {
+                        let mut owned_validate_buf = loop_validate_buf.take().unwrap();
+                        owned_validate_buf.resize(block_size, 0);
+                        let std_file = unsafe { std::fs::File::from_raw_fd(file.as_raw_fd()) };
+                        let nread = std_file
+                            .read_at(&mut owned_validate_buf, offset_in_file)
+                            .unwrap();
+                        assert_eq!(nread, block_size);
+                        assert_eq!(owned_buf, owned_validate_buf);
+                        loop_validate_buf = Some(owned_validate_buf);
+                        std_file.into_raw_fd(); // we used as_raw_fd above, don't make the Drop of std_file close the fd
+                    }
                     loop_buf = Some(owned_buf);
                     file.into_raw_fd(); // so that it's there for next iteration
                 }
