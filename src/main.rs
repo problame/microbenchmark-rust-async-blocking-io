@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use clap::Parser;
@@ -161,6 +161,17 @@ struct StatsState {
     tokio_rio_epoll_iterations: AtomicU64,
 }
 
+impl StatsState {
+    fn make_latency_histogram() -> hdrhistogram::Histogram<u64> {
+        hdrhistogram::Histogram::new_with_bounds(1, 10_000_000, 3).unwrap()
+    }
+    fn record_iop_latency(&self, client_num: usize, latency: Duration) {
+        let mut h = self.latencies_histo[client_num].lock().unwrap();
+        h.record(u64::try_from(latency.as_micros()).unwrap())
+            .unwrap();
+    }
+}
+
 trait Engine {
     fn run(
         self: Box<Self>,
@@ -172,10 +183,6 @@ trait Engine {
 }
 
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
-
-fn make_histogram() -> hdrhistogram::Histogram<u64> {
-    hdrhistogram::Histogram::new_with_bounds(1, 10_000_000, 3).unwrap()
-}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -200,7 +207,7 @@ fn main() {
             .collect(),
         latencies_histo: (0..works.len())
             .into_iter()
-            .map(|_| CachePadded::new(Mutex::new(make_histogram())))
+            .map(|_| CachePadded::new(Mutex::new(StatsState::make_latency_histogram())))
             .collect(),
         client0_latency_sample: AtomicU64::new(0),
         tokio_rio_epoll_iterations: AtomicU64::new(0),
@@ -226,7 +233,8 @@ fn main() {
             move || {
                 let mut per_task_total_reads = HashMap::new();
 
-                let mut histo = make_histogram();
+                // allocate once outside the loop
+                let mut histo = StatsState::make_latency_histogram();
 
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(MONITOR_PERIOD);
@@ -623,6 +631,7 @@ impl EngineStd {
             }
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -734,6 +743,7 @@ impl EngineTokioOnExecutorThread {
             }
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             // if i == 0 {
             // info!("Client {i} read took {:?}", start.elapsed());
             stats_state
@@ -863,6 +873,7 @@ impl EngineTokioSpawnBlocking {
             .unwrap();
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -1034,6 +1045,7 @@ impl EngineTokioFlume {
                 .expect("not expecting io errors");
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -1367,6 +1379,7 @@ impl EngineTokioRio {
 
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             if i == 0 {
                 stats_state
                     .client0_latency_sample
@@ -1502,9 +1515,6 @@ impl EngineTokioIoUringEventfdBridge {
         };
         let mut loop_validate_buf = Some(validate_buf);
 
-        let mut latencies_batch_last_flush = None;
-        let mut latencies_batch = Vec::new();
-
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
             // simulate Timeline::layers.read().await
@@ -1562,21 +1572,7 @@ impl EngineTokioIoUringEventfdBridge {
 
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
-
-            let now = Instant::now();
-            if now.duration_since(*latencies_batch_last_flush.get_or_insert(now)) > MONITOR_PERIOD {
-                for lat in &latencies_batch {
-                    stats_state.latencies_histo[usize::try_from(i).unwrap()]
-                        .lock()
-                        .unwrap()
-                        .record(*lat as u64)
-                        .unwrap()
-                }
-                latencies_batch.clear();
-                latencies_batch_last_flush = Some(now);
-            }
-            let latency_micros = start.elapsed().as_micros() as f64;
-            latencies_batch.push(latency_micros);
+            stats_state.record_iop_latency(usize::try_from(i).unwrap(), start.elapsed());
             if i == 0 {
                 stats_state
                     .client0_latency_sample
