@@ -233,16 +233,14 @@ fn main() {
                 let mut per_task_total_reads = HashMap::new();
 
                 struct AggregatedStats {
-                    what: String,
                     start: std::time::Instant,
                     op_count: u64,
                     op_size: u64,
                     latencies_histo: hdrhistogram::Histogram<u64>,
                 }
                 impl AggregatedStats {
-                    fn new(what: String, op_size: u64) -> Self {
+                    fn new(op_size: u64) -> Self {
                         Self {
-                            what,
                             start: std::time::Instant::now(),
                             op_count: 0,
                             op_size,
@@ -259,13 +257,15 @@ fn main() {
                         let total_reads = self.op_count;
                         let delta_t = self.start.elapsed().as_secs_f64();
                         info!(
-                            "{}: avg over {:.2}s: IOPS={} TP={:.2} p50={}, p90={}, p99={}, p999={} p9999={}",
-                            self.what,
+                            "avg over last {:.2}s: TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} p50={}, p90={}, p99={}, p999={} p9999={}",
                             delta_t,
                             (total_reads as f64) / delta_t,
                             (total_reads as f64) * ((self.op_size) as f64)
                                 / ((1 << 20) as f64)
                                 / delta_t,
+                            histo.min(),
+                            histo.mean(),
+                            histo.max(),
                             histo.value_at_percentile(50.0),
                             histo.value_at_percentile(90.0),
                             histo.value_at_percentile(99.0),
@@ -276,8 +276,8 @@ fn main() {
                 }
 
                 let op_size = 1 << args.block_size_shift.get();
-                let mut totals = AggregatedStats::new("since start".to_owned(), op_size);
-                let mut this_round = AggregatedStats::new("since last".to_owned(), op_size);
+                let mut totals = AggregatedStats::new(op_size);
+                let mut this_round = AggregatedStats::new(op_size);
                 while !engine_stopped.load(Ordering::Relaxed) {
                     this_round.reset(std::time::Instant::now());
                     std::thread::sleep(MONITOR_PERIOD);
