@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -156,6 +156,7 @@ struct EngineTokioSpawnBlocking {
 
 struct StatsState {
     reads_in_last_second: Vec<crossbeam_utils::CachePadded<AtomicU64>>,
+    latencies: crossbeam_utils::CachePadded<Mutex<incr_stats::incr::Stats>>,
     client0_latency_sample: AtomicU64,
     tokio_rio_epoll_iterations: AtomicU64,
 }
@@ -169,6 +170,8 @@ trait Engine {
         reads_in_last_second: Arc<StatsState>,
     );
 }
+
+const MONITOR_PERIOD: Duration = Duration::from_secs(1);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -191,6 +194,7 @@ fn main() {
             .into_iter()
             .map(|_| CachePadded::new(AtomicU64::new(0)))
             .collect(),
+        latencies: CachePadded::new(Mutex::new(incr_stats::incr::Stats::new())),
         client0_latency_sample: AtomicU64::new(0),
         tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
@@ -214,7 +218,7 @@ fn main() {
             let mut per_task_total_reads = HashMap::new();
 
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(MONITOR_PERIOD);
                 let mut reads_in_last_second = 0;
                 for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
                     let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
@@ -234,6 +238,21 @@ fn main() {
                     client0_latency_sample,
                     (1 << args.block_size_shift.get()) * reads_in_last_second / (1 << 20),
                 );
+                let mut latencies = stats_state.latencies.lock().unwrap();
+                // ignore printing errors
+                let _ = (|| {
+                    info!(
+                        "Latency stats: min={} max={} mean={} sample_variance={}",
+                        latencies.min()?,
+                        latencies.max()?,
+                        latencies.mean()?,
+                        latencies.sample_variance()?,
+                    );
+                    anyhow::Ok(())
+                })();
+                *latencies = incr_stats::incr::Stats::new(); // reset for next iteration
+                drop(latencies);
+
                 match args.work_kind.engine() {
                     EngineKind::TokioRio { mode } => match mode {
                         TokioRioModeKind::Epoll | TokioRioModeKind::EpollExecutorThreadLocal => {
@@ -1470,6 +1489,9 @@ impl EngineTokioIoUringEventfdBridge {
         };
         let mut loop_validate_buf = Some(validate_buf);
 
+        let mut latencies_batch_last_flush = None;
+        let mut latencies_batch = Vec::new();
+
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
             // simulate Timeline::layers.read().await
@@ -1527,6 +1549,22 @@ impl EngineTokioIoUringEventfdBridge {
 
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
+
+            let now = Instant::now();
+            if now.duration_since(*latencies_batch_last_flush.get_or_insert(now))
+                > MONITOR_PERIOD.div_f64(3.0)
+            {
+                stats_state
+                    .latencies
+                    .lock()
+                    .unwrap()
+                    .array_update(&latencies_batch)
+                    .unwrap();
+                latencies_batch.clear();
+                latencies_batch_last_flush = Some(now);
+            }
+            let latency_micros = start.elapsed().as_micros() as f64;
+            latencies_batch.push(latency_micros);
             if i == 0 {
                 stats_state
                     .client0_latency_sample
