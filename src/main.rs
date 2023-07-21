@@ -185,6 +185,8 @@ const MONITOR_PERIOD: Duration = Duration::from_secs(1);
 
 fn main() {
     tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
         .with_env_filter({
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .expect("must set RUST_LOG variable")
@@ -215,9 +217,12 @@ fn main() {
     ctrlc::set_handler({
         let stop_engine = Arc::clone(&stop_engine);
         move || {
+            info!("ctrl-c, setting stop flag");
             if stop_engine.fetch_or(true, Ordering::Relaxed) {
                 error!("Received second SIGINT, aborting");
                 std::process::abort();
+            } else {
+                info!("first ctrl-c, stop flag set");
             }
         }
     })
@@ -546,6 +551,7 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
         }
         EngineKind::TokioIoUringEventfdBridge => {
             let rt = tokio::runtime::Builder::new_multi_thread()
+                // .worker_threads(1) // useful for debugging
                 .enable_all()
                 .build()
                 .unwrap();
@@ -1554,7 +1560,7 @@ impl EngineTokioIoUringEventfdBridge {
                     //  affine to a completion queue somehow... The design space is big.)
 
                     let (file, owned_buf, res) =
-                        tokio_io_uring_eventfd_bridge::preadv(file, offset_in_file, owned_buf)
+                        tokio_io_uring_eventfd_bridge::thread_local_system::ThreadLocalSystem::preadv(file, offset_in_file, owned_buf)
                             .await;
                     let count = res.unwrap();
                     assert_eq!(count, owned_buf.len());
