@@ -1559,9 +1559,13 @@ impl EngineTokioIoUringEventfdBridge {
                     // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
                     //  affine to a completion queue somehow... The design space is big.)
 
-                    let (file, owned_buf, res) =
-                        tokio_io_uring_eventfd_bridge::thread_local_system::ThreadLocalSystem::preadv(file, offset_in_file, owned_buf)
-                            .await;
+                    let (file, owned_buf, res) = tokio_io_uring_eventfd_bridge::read(
+                        tokio_io_uring_eventfd_bridge::system_lifecycle::ThreadLocal,
+                        file,
+                        offset_in_file,
+                        owned_buf,
+                    )
+                    .await;
                     let count = res.unwrap();
                     assert_eq!(count, owned_buf.len());
                     assert_eq!(count, block_size);
