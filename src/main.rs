@@ -105,7 +105,7 @@ enum EngineKind {
     TokioRio {
         mode: TokioRioModeKind,
     },
-    TokioIoUringEventfdBridge,
+    TokioEpollUring,
 }
 
 struct EngineStd {}
@@ -549,13 +549,13 @@ fn setup_engine(engine_kind: &EngineKind) -> Box<dyn Engine> {
                 },
             })
         }
-        EngineKind::TokioIoUringEventfdBridge => {
+        EngineKind::TokioEpollUring => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 // .worker_threads(1) // useful for debugging
                 .enable_all()
                 .build()
                 .unwrap();
-            Box::new(EngineTokioIoUringEventfdBridge { rt })
+            Box::new(EngineTokioEpollUring { rt })
         }
     }
 }
@@ -1408,11 +1408,11 @@ impl EngineTokioRio {
     }
 }
 
-struct EngineTokioIoUringEventfdBridge {
+struct EngineTokioEpollUring {
     rt: tokio::runtime::Runtime,
 }
 
-impl Engine for EngineTokioIoUringEventfdBridge {
+impl Engine for EngineTokioEpollUring {
     fn run(
         self: Box<Self>,
         args: &'static Args,
@@ -1420,7 +1420,7 @@ impl Engine for EngineTokioIoUringEventfdBridge {
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
     ) {
-        let EngineTokioIoUringEventfdBridge { rt } = *self;
+        let EngineTokioEpollUring { rt } = *self;
         let rt = Arc::new(rt);
 
         rt.block_on(async move {
@@ -1482,7 +1482,7 @@ impl Engine for EngineTokioIoUringEventfdBridge {
     }
 }
 
-impl EngineTokioIoUringEventfdBridge {
+impl EngineTokioEpollUring {
     #[tracing::instrument(skip_all, level="trace", fields(client=%i))]
     async fn client(
         i: u64,
@@ -1559,8 +1559,8 @@ impl EngineTokioIoUringEventfdBridge {
                     // (Even more ideal: a runtime that is io_uring-aware and keeps tasks that wait for wakeup from a completion
                     //  affine to a completion queue somehow... The design space is big.)
 
-                    let (file, owned_buf, res) = tokio_io_uring_eventfd_bridge::read(
-                        tokio_io_uring_eventfd_bridge::system_lifecycle::ThreadLocal,
+                    let (file, owned_buf, res) = tokio_epoll_uring::read(
+                        tokio_epoll_uring::ThreadLocalSystemLauncher,
                         file,
                         offset_in_file,
                         owned_buf,
