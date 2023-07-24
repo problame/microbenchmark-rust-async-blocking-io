@@ -174,7 +174,7 @@ impl StatsState {
 trait Engine {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         reads_in_last_second: Arc<StatsState>,
@@ -193,7 +193,7 @@ fn main() {
         })
         .init();
 
-    let args: &'static Args = Box::leak(Box::new(Args::parse()));
+    let args: Arc<Args> = Arc::new(Args::parse());
 
     let stop_engine = Arc::new(AtomicBool::new(false));
     let engine_stopped = Arc::new(AtomicBool::new(false));
@@ -233,6 +233,7 @@ fn main() {
         .spawn({
             let engine_stopped = Arc::clone(&engine_stopped);
             let stats_state = Arc::clone(&stats_state);
+            let args = Arc::clone(&args);
 
             move || {
                 let mut per_task_total_reads = HashMap::new();
@@ -351,7 +352,7 @@ fn main() {
         })
         .unwrap();
 
-    engine.run(&args, works, stop_engine, stats_state);
+    engine.run(args.clone(), works, stop_engine, stats_state);
     engine_stopped.store(true, Ordering::Relaxed);
     monitor.join().unwrap();
 }
@@ -616,7 +617,7 @@ fn open_file_direct_io(
 impl Engine for EngineStd {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -628,7 +629,10 @@ impl Engine for EngineStd {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let myself = Arc::clone(&myself);
-                scope.spawn(move || myself.client(i, &args, work, &stop, stats_state));
+                scope.spawn({
+                    let args = Arc::clone(&args);
+                    move || myself.client(i, Arc::clone(&args), work, &stop, stats_state)
+                });
             }
         });
     }
@@ -637,7 +641,7 @@ impl EngineStd {
     fn client(
         &self,
         i: u64,
-        args: &Args,
+        args: Arc<Args>,
         mut work: ClientWork,
         stop: &AtomicBool,
         stats_state: Arc<StatsState>,
@@ -662,7 +666,7 @@ impl EngineStd {
                     if *validate {
                         unimplemented!()
                     }
-                    self.read_iter(i, args, file, offset_in_file, buf);
+                    self.read_iter(i, &args, file, offset_in_file, buf);
                 }
                 ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
                     timerfd.set_state(
@@ -702,7 +706,7 @@ struct EngineTokioOnExecutorThread {
 impl Engine for EngineTokioOnExecutorThread {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -717,8 +721,19 @@ impl Engine for EngineTokioOnExecutorThread {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let all_client_tasks_spawned = Arc::clone(&all_client_tasks_spawned);
-                handles.push(tokio::spawn(async move {
-                    Self::client(i, &args, work, &stop, stats_state, all_client_tasks_spawned).await
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move {
+                        Self::client(
+                            i,
+                            Arc::clone(&args),
+                            work,
+                            &stop,
+                            stats_state,
+                            all_client_tasks_spawned,
+                        )
+                        .await
+                    }
                 }));
             }
             for handle in handles {
@@ -731,7 +746,7 @@ impl Engine for EngineTokioOnExecutorThread {
 impl EngineTokioOnExecutorThread {
     async fn client(
         i: u64,
-        args: &Args,
+        args: Arc<Args>,
         mut work: ClientWork,
         stop: &AtomicBool,
         stats_state: Arc<StatsState>,
@@ -791,7 +806,7 @@ impl EngineTokioOnExecutorThread {
 impl Engine for EngineTokioSpawnBlocking {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -803,9 +818,11 @@ impl Engine for EngineTokioSpawnBlocking {
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
-                handles.push(tokio::spawn(async move {
-                    Self::client(i, &args, work, &stop, stats_state).await
-                }));
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move {
+                    Self::client(i, Arc::clone(&args), work, &stop, stats_state).await
+                }}));
             }
             for handle in handles {
                 handle.await.unwrap();
@@ -817,7 +834,7 @@ impl Engine for EngineTokioSpawnBlocking {
 impl EngineTokioSpawnBlocking {
     async fn client(
         i: u64,
-        args: &Args,
+        args: Arc<Args>,
         work: ClientWork,
         stop: &AtomicBool,
         stats_state: Arc<StatsState>,
@@ -921,7 +938,7 @@ struct EngineTokioFlume {
 impl Engine for EngineTokioFlume {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -945,10 +962,13 @@ impl Engine for EngineTokioFlume {
                 let stats_state = Arc::clone(&stats_state);
                 let worker_tx = worker_tx.clone();
                 let myself = Arc::clone(&myself);
-                handles.push(tokio::spawn(async move {
-                    myself
-                        .client(worker_tx, i, &args, work, &stop, stats_state)
-                        .await
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move {
+                        myself
+                            .client(worker_tx, i, &args, work, &stop, stats_state)
+                            .await
+                    }
                 }));
             }
             for handle in handles {
@@ -1108,7 +1128,7 @@ thread_local! {
 impl Engine for EngineTokioRio {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -1237,8 +1257,9 @@ impl Engine for EngineTokioRio {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
                 let mode = mode.clone();
-                handles.push(tokio::spawn(async move {
-                    Self::client(mode, i, &args, work, &stop, stats_state).await
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move { Self::client(mode, i, &args, work, &stop, stats_state).await }
                 }));
             }
             for handle in handles {
@@ -1415,7 +1436,7 @@ struct EngineTokioEpollUring {
 impl Engine for EngineTokioEpollUring {
     fn run(
         self: Box<Self>,
-        args: &'static Args,
+        args: Arc<Args>,
         works: Vec<ClientWork>,
         stop: Arc<AtomicBool>,
         stats_state: Arc<StatsState>,
@@ -1428,8 +1449,9 @@ impl Engine for EngineTokioEpollUring {
             for (i, work) in (0..args.num_clients.get()).zip(works.into_iter()) {
                 let stop = Arc::clone(&stop);
                 let stats_state = Arc::clone(&stats_state);
-                handles.push(tokio::spawn(async move {
-                    Self::client(i, &args, work, &stop, stats_state).await
+                handles.push(tokio::spawn({
+                    let args = Arc::clone(&args);
+                    async move { Self::client(i, &args, work, &stop, stats_state).await }
                 }));
             }
             // task that prints periodically which clients have exited
@@ -1496,7 +1518,6 @@ impl EngineTokioEpollUring {
         let block_size = 1 << args.block_size_shift.get();
 
         let rwlock = Arc::new(tokio::sync::RwLock::new(()));
-        std::mem::forget(Arc::clone(&rwlock));
 
         #[derive(Copy, Clone)]
         enum ClientWorkFd {
