@@ -19,9 +19,10 @@ use clap::Parser;
 use crossbeam_utils::CachePadded;
 use itertools::Itertools;
 use rand::{Rng, RngCore};
+use serde_with::serde_as;
 use tracing::{debug, error, info};
 
-#[derive(clap::Parser)]
+#[derive(serde::Serialize, clap::Parser, Clone)]
 struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
@@ -30,13 +31,13 @@ struct Args {
     work_kind: WorkKind,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum, serde::Serialize)]
 enum ValidateMode {
     NoValidate,
     Validate,
 }
 
-#[derive(Clone, Copy, clap::Subcommand)]
+#[derive(Clone, Copy, clap::Subcommand, serde::Serialize)]
 enum WorkKind {
     DiskAccess {
         validate: ValidateMode,
@@ -53,7 +54,7 @@ enum WorkKind {
     },
 }
 
-#[derive(Clone, Copy, clap::Subcommand)]
+#[derive(Clone, Copy, clap::Subcommand, serde::Serialize)]
 enum TimerFdExperiationModeKind {
     Oneshot {
         micros: NonZeroU64,
@@ -79,7 +80,7 @@ impl WorkKind {
     }
 }
 
-#[derive(Copy, Clone, clap::Subcommand)]
+#[derive(Copy, Clone, clap::Subcommand, serde::Serialize)]
 enum DiskAccessKind {
     DirectIo {
         #[clap(subcommand)]
@@ -91,7 +92,7 @@ enum DiskAccessKind {
     },
 }
 
-#[derive(Clone, Copy, clap::Subcommand)]
+#[derive(Clone, Copy, clap::Subcommand, serde::Serialize)]
 enum EngineKind {
     Std,
     TokioOnExecutorThread,
@@ -115,7 +116,7 @@ struct EngineTokioRio {
     mode: TokioRioMode,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum, serde::Serialize)]
 enum TokioRioModeKind {
     SingleGlobal,
     ExecutorThreadLocal,
@@ -235,55 +236,113 @@ fn main() {
             let stats_state = Arc::clone(&stats_state);
             let args = Arc::clone(&args);
 
+            struct AggregatedStats {
+                start: std::time::Instant,
+                op_count: u64,
+                op_size: u64,
+                latencies_histo: hdrhistogram::Histogram<u64>,
+            }
+            const LATENCY_PERCENTILES: [f64; 7] = [50.0, 90.0, 99.0, 99.9, 99.99, 99.999, 99.9999];
+            fn latency_percentiles_serialize<S>(
+                values: &[u64; LATENCY_PERCENTILES.len()],
+                serializer: S,
+            ) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serde::Serialize::serialize(
+                    &LATENCY_PERCENTILES
+                        .iter()
+                        .map(|p| format!("p{p}"))
+                        .zip(values.iter().cloned())
+                        .collect::<HashMap<_, _>>(),
+                    serializer,
+                )
+            }
+            #[serde_as]
+            #[derive(serde::Serialize)]
+            struct AggregatedStatsSummary {
+                #[serde_as(as = "serde_with::DurationMicroSeconds")]
+                elapsed_us: std::time::Duration,
+                throughput_iops: f64,
+                throughput_bw_mibps: f64,
+                latency_min_us: u64,
+                latency_mean_us: f64,
+                latency_max_us: u64,
+                #[serde(serialize_with = "latency_percentiles_serialize")]
+                latency_percentiles: [u64; LATENCY_PERCENTILES.len()],
+            }
+
+            impl std::fmt::Display for AggregatedStatsSummary {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} {}",
+                        self.throughput_iops,
+                        self.throughput_bw_mibps,
+                        self.latency_min_us,
+                        self.latency_mean_us,
+                        self.latency_max_us,
+                        self.latency_percentiles
+                            .iter()
+                            .zip(LATENCY_PERCENTILES.iter())
+                            .map(|(v, p)| format!("p{p}={v}"))
+                            .join(" "),
+                    )
+                }
+            }
+            impl AggregatedStats {
+                fn new(op_size: u64) -> Self {
+                    Self {
+                        start: std::time::Instant::now(),
+                        op_count: 0,
+                        op_size,
+                        latencies_histo: StatsState::make_latency_histogram(),
+                    }
+                }
+                fn reset(&mut self, start: std::time::Instant) {
+                    self.start = start;
+                    self.op_count = 0;
+                    self.latencies_histo.clear();
+                }
+                fn summary_since_start(&self) -> AggregatedStatsSummary {
+                    let elapsed = self.start.elapsed();
+                    let elapsed_secs = elapsed.as_secs_f64();
+                    let histo = &self.latencies_histo;
+                    AggregatedStatsSummary {
+                        elapsed_us: elapsed,
+                        throughput_iops: (self.op_count as f64) / elapsed_secs,
+                        throughput_bw_mibps: (self.op_count as f64) * ((self.op_size) as f64)
+                            / ((1 << 20) as f64)
+                            / elapsed_secs,
+                        latency_min_us: histo.min(),
+                        latency_mean_us: histo.mean(),
+                        latency_max_us: histo.max(),
+                        latency_percentiles: {
+                            let mut values = [0; LATENCY_PERCENTILES.len()];
+                            for (i, value_ref) in values.iter_mut().enumerate() {
+                                *value_ref = histo.value_at_percentile(LATENCY_PERCENTILES[i]);
+                            }
+                            values
+                        },
+                    }
+                }
+            }
+
+            #[derive(serde::Serialize)]
+            struct BenchmarkOutput {
+                args: Args,
+                sorted_per_task_total_reads: Vec<u64>,
+                totals: Vec<AggregatedStatsSummary>,
+            }
+
             move || {
                 let mut per_task_total_reads = HashMap::new();
-
-                struct AggregatedStats {
-                    start: std::time::Instant,
-                    op_count: u64,
-                    op_size: u64,
-                    latencies_histo: hdrhistogram::Histogram<u64>,
-                }
-                impl AggregatedStats {
-                    fn new(op_size: u64) -> Self {
-                        Self {
-                            start: std::time::Instant::now(),
-                            op_count: 0,
-                            op_size,
-                            latencies_histo: StatsState::make_latency_histogram(),
-                        }
-                    }
-                    fn reset(&mut self, start: std::time::Instant) {
-                        self.start = start;
-                        self.op_count = 0;
-                        self.latencies_histo.clear();
-                    }
-                    fn print_avg_since_start_stats(&self) {
-                        let histo = &self.latencies_histo;
-                        let total_reads = self.op_count;
-                        let delta_t = self.start.elapsed().as_secs_f64();
-                        info!(
-                            "avg over last {:.2}s: TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} p50={}, p90={}, p99={}, p999={} p9999={}",
-                            delta_t,
-                            (total_reads as f64) / delta_t,
-                            (total_reads as f64) * ((self.op_size) as f64)
-                                / ((1 << 20) as f64)
-                                / delta_t,
-                            histo.min(),
-                            histo.mean(),
-                            histo.max(),
-                            histo.value_at_percentile(50.0),
-                            histo.value_at_percentile(90.0),
-                            histo.value_at_percentile(99.0),
-                            histo.value_at_percentile(99.9),
-                            histo.value_at_percentile(99.99),
-                        );
-                    }
-                }
-
                 let op_size = 1 << args.block_size_shift.get();
-                let mut totals = AggregatedStats::new(op_size);
+                let mut total = AggregatedStats::new(op_size);
+                let mut total_summaries = Vec::new();
                 let mut this_round = AggregatedStats::new(op_size);
+
                 while !engine_stopped.load(Ordering::Relaxed) {
                     this_round.reset(std::time::Instant::now());
                     std::thread::sleep(MONITOR_PERIOD);
@@ -292,17 +351,22 @@ fn main() {
                         let per_task = per_task_total_reads.entry(client).or_insert(0);
                         *per_task += task_reads_in_last_second;
                         this_round.op_count += task_reads_in_last_second;
-                        totals.op_count += task_reads_in_last_second;
+                        total.op_count += task_reads_in_last_second;
                     }
                     for h in &stats_state.latencies_histo {
                         let mut h = h.lock().unwrap();
-                        totals.latencies_histo += &*h;
+                        total.latencies_histo += &*h;
                         this_round.latencies_histo += &*h;
                         h.clear();
                     }
 
-                   this_round.print_avg_since_start_stats();
-                   totals.print_avg_since_start_stats();
+                    let this_round_summary = this_round.summary_since_start();
+                    let total_summary = total.summary_since_start();
+
+                    info!("{this_round_summary}");
+                    info!("{total_summary}");
+
+                    total_summaries.push(total_summary);
 
                     match args.work_kind.engine() {
                         EngineKind::TokioRio { mode } => match mode {
@@ -332,22 +396,19 @@ fn main() {
                 //
                 // command line to get something for copy-paste into google sheets:
                 //  ssh neon-devvm-mbp ssh testinstance sudo cat /mnt/per_task_total_reads.json | jq '.[]' | pbcopy
-                let sorted_per_task_total_reads = per_task_total_reads
-                    .values()
-                    .cloned()
-                    .sorted()
-                    .map(|v| v as f64)
-                    .collect::<Vec<f64>>();
-                let outpath = std::path::PathBuf::from("per_task_total_reads.json");
-                info!("writing per-task total read count to {:?}", outpath);
-                std::fs::write(
-                    &outpath,
-                    serde_json::to_string(&sorted_per_task_total_reads).unwrap(),
-                )
-                .unwrap();
+                let sorted_per_task_total_reads =
+                    per_task_total_reads.values().cloned().sorted().collect();
+                let output = BenchmarkOutput {
+                    args: args.as_ref().clone(),
+                    sorted_per_task_total_reads,
+                    totals: total_summaries,
+                };
+                let outpath = std::path::PathBuf::from("benchmark.output.json");
+                info!("writing results to to {:?}", outpath);
+                std::fs::write(&outpath, serde_json::to_string(&output).unwrap()).unwrap();
 
-                totals.print_avg_since_start_stats();
-
+                let total_summary = total.summary_since_start();
+                info!("total: {}", total_summary);
             }
         })
         .unwrap();
