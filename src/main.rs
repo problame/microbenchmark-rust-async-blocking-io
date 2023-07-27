@@ -8,6 +8,7 @@ use std::{
         unix::prelude::FileExt,
     },
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -27,8 +28,35 @@ struct Args {
     num_clients: NonZeroU64,
     file_size_mib: NonZeroU64,
     block_size_shift: NonZeroU64,
+    #[clap(long, default_value = "until-ctrl-c")]
+    run_duration: RunDuration,
     #[clap(subcommand)]
     work_kind: WorkKind,
+}
+
+#[derive(Clone, serde::Serialize)]
+enum RunDuration {
+    UntilCtrlC,
+    FixedDuration(Duration),
+    FixedIoCount(u64),
+}
+
+impl FromStr for RunDuration {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
+            x if x.ends_with("ios") => match s[..s.len() - 4].parse::<u64>() {
+                Ok(ios) => Ok(RunDuration::FixedIoCount(ios)),
+                Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
+            },
+            x => match humantime::parse_duration(x) {
+                Ok(d) => Ok(RunDuration::FixedDuration(d)),
+                Err(e) => Err(format!("invalid duration: {e}: {s:?}")),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum, serde::Serialize)]
@@ -215,12 +243,27 @@ fn main() {
         tokio_rio_epoll_iterations: AtomicU64::new(0),
     });
 
+    match args.run_duration {
+        RunDuration::UntilCtrlC => {}
+        RunDuration::FixedDuration(duration) => {
+            let stop_engine = Arc::clone(&stop_engine);
+            std::thread::spawn(move || {
+                std::thread::sleep(duration);
+                info!("configured runtime expired, setting stop flag");
+                stop_engine.store(true, Ordering::Relaxed);
+            });
+        }
+        RunDuration::FixedIoCount(_) => {
+            unimplemented!()
+        }
+    }
+
     ctrlc::set_handler({
         let stop_engine = Arc::clone(&stop_engine);
         move || {
             info!("ctrl-c, setting stop flag");
             if stop_engine.fetch_or(true, Ordering::Relaxed) {
-                error!("Received second SIGINT, aborting");
+                error!("stop flag was already set, aborting");
                 std::process::abort();
             } else {
                 info!("first ctrl-c, stop flag set");
@@ -277,7 +320,8 @@ fn main() {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     write!(
                         f,
-                        "TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} {}",
+                        "t{:.2} TP: iops={:.0} bw={:.2} LAT(us): min={} mean={:.0} max={} {}",
+                        self.elapsed_us.as_secs_f64(),
                         self.throughput_iops,
                         self.throughput_bw_mibps,
                         self.latency_min_us,
