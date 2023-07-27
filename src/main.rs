@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     io::{Seek, Write},
     num::NonZeroU64,
+    ops::ControlFlow,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::prelude::FileExt,
@@ -10,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -38,7 +39,7 @@ struct Args {
 enum RunDuration {
     UntilCtrlC,
     FixedDuration(Duration),
-    FixedIoCount(u64),
+    FixedTotalIoCount(u64),
 }
 
 impl FromStr for RunDuration {
@@ -47,10 +48,22 @@ impl FromStr for RunDuration {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "until-ctrl-c" => Ok(RunDuration::UntilCtrlC),
-            x if x.ends_with("ios") => match s[..s.len() - 4].parse::<u64>() {
-                Ok(ios) => Ok(RunDuration::FixedIoCount(ios)),
-                Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
-            },
+            x if x.ends_with("total-ios") => {
+                let stripped = &s[..s.len() - "total-ios".len()];
+                let (stripped, multiplier) = if stripped.ends_with("k-") {
+                    (&stripped[..stripped.len() - 2], 1000)
+                } else if stripped.ends_with("m-") {
+                    (&stripped[..stripped.len() - 2], 1000 * 1000)
+                } else if stripped.ends_with("g-") {
+                    (&stripped[..stripped.len() - 2], 1000 * 1000 * 1000)
+                } else {
+                    (stripped, 1)
+                };
+                match stripped.parse::<NonZeroU64>() {
+                    Ok(n) => Ok(RunDuration::FixedTotalIoCount(n.get() * multiplier)),
+                    Err(e) => Err(format!("invalid io count: {e}: {s:?}")),
+                }
+            }
             x => match humantime::parse_duration(x) {
                 Ok(d) => Ok(RunDuration::FixedDuration(d)),
                 Err(e) => Err(format!("invalid duration: {e}: {s:?}")),
@@ -254,8 +267,8 @@ fn main() {
                 stop_engine.store(true, Ordering::Relaxed);
             });
         }
-        RunDuration::FixedIoCount(_) => {
-            unimplemented!()
+        RunDuration::FixedTotalIoCount(_) => {
+            // done earlier in setup_client_works
         }
     }
 
@@ -476,7 +489,30 @@ fn main() {
     monitor.join().unwrap();
 }
 
-enum ClientWork {
+#[derive(Clone)]
+struct OpsLeft(Option<Arc<AtomicI64>>);
+
+struct ClientWork {
+    ops_left: OpsLeft,
+    kind: ClientWorkKind,
+}
+
+impl OpsLeft {
+    fn take_one_op(&self) -> ControlFlow<()> {
+        match &self.0 {
+            None => (),
+            Some(ops_left) => {
+                let ops_left = ops_left.fetch_sub(1, Ordering::Relaxed);
+                if ops_left < 0 {
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+enum ClientWorkKind {
     DiskAccess {
         file: std::fs::File,
         validate: bool,
@@ -489,6 +525,13 @@ enum ClientWork {
 }
 
 fn setup_client_works(args: &Args) -> Vec<ClientWork> {
+    let ops_left = OpsLeft(match args.run_duration {
+        RunDuration::UntilCtrlC => None,
+        RunDuration::FixedDuration(_) => None,
+        RunDuration::FixedTotalIoCount(total_io_count) => Some(Arc::new(AtomicI64::new(
+            i64::try_from(total_io_count).unwrap(),
+        ))),
+    });
     match &args.work_kind {
         WorkKind::DiskAccess {
             disk_access_kind,
@@ -507,11 +550,14 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
                     OpenFileMode::Read,
                     &data_file_path(args, i),
                 );
-                client_files.push(ClientWork::DiskAccess {
-                    file,
-                    validate: match validate {
-                        ValidateMode::NoValidate => false,
-                        ValidateMode::Validate => true,
+                client_files.push(ClientWork {
+                    ops_left: ops_left.clone(),
+                    kind: ClientWorkKind::DiskAccess {
+                        file,
+                        validate: match validate {
+                            ValidateMode::NoValidate => false,
+                            ValidateMode::Validate => true,
+                        },
                     },
                 });
             }
@@ -519,19 +565,23 @@ fn setup_client_works(args: &Args) -> Vec<ClientWork> {
         }
         WorkKind::TimerFd { expiration_mode } => (0..args.num_clients.get())
             .map(|_| match expiration_mode {
-                TimerFdExperiationModeKind::Oneshot { micros, engine: _ } => {
-                    ClientWork::TimerFdSetStateAndRead {
+                TimerFdExperiationModeKind::Oneshot { micros, engine: _ } => ClientWork {
+                    ops_left: ops_left.clone(),
+                    kind: ClientWorkKind::TimerFdSetStateAndRead {
                         timerfd: {
                             timerfd::TimerFd::new_custom(timerfd::ClockId::Monotonic, false, true)
                                 .unwrap()
                         },
                         duration: Duration::from_micros(micros.get()),
-                    }
-                }
+                    },
+                },
             })
             .collect(),
         WorkKind::NoWork { engine: _ } => (0..args.num_clients.get())
-            .map(|_| ClientWork::NoWork {})
+            .map(|_| ClientWork {
+                ops_left: ops_left.clone(),
+                kind: ClientWorkKind::NoWork {},
+            })
             .collect(),
     }
 }
@@ -783,27 +833,31 @@ impl EngineStd {
         let buf: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf, block_size) };
         let block_size: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // find a random aligned 8k offset inside the file
             debug_assert!(1024 * 1024 % block_size == 0);
             let offset_in_file = rand::thread_rng()
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size))
                 * block_size;
             let start = std::time::Instant::now();
-            match &mut work {
-                ClientWork::DiskAccess { file, validate } => {
+            match &mut work.kind {
+                ClientWorkKind::DiskAccess { file, validate } => {
                     if *validate {
                         unimplemented!()
                     }
                     self.read_iter(i, &args, file, offset_in_file, buf);
                 }
-                ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+                ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                     timerfd.set_state(
                         timerfd::TimerState::Oneshot(*duration),
                         timerfd::SetTimeFlags::Default,
                     );
                     timerfd.read();
                 }
-                ClientWork::NoWork {} => {}
+                ClientWorkKind::NoWork {} => {}
             }
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
@@ -900,6 +954,10 @@ impl EngineTokioOnExecutorThread {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
@@ -909,21 +967,21 @@ impl EngineTokioOnExecutorThread {
                 .gen_range(0..=((args.file_size_mib.get() * 1024 * 1024 - 1) / block_size_u64))
                 * block_size_u64;
             let start = std::time::Instant::now();
-            match &mut work {
-                ClientWork::DiskAccess { file, validate } => {
+            match &mut work.kind {
+                ClientWorkKind::DiskAccess { file, validate } => {
                     if *validate {
                         unimplemented!()
                     }
                     file.read_at(buf, offset_in_file).unwrap();
                 }
-                ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+                ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                     timerfd.set_state(
                         timerfd::TimerState::Oneshot(*duration),
                         timerfd::SetTimeFlags::Default,
                     );
                     timerfd.read();
                 }
-                ClientWork::NoWork {} => {}
+                ClientWorkKind::NoWork {} => {}
             }
             stats_state.reads_in_last_second[usize::try_from(i).unwrap()]
                 .fetch_add(1, Ordering::Relaxed);
@@ -986,17 +1044,17 @@ impl EngineTokioSpawnBlocking {
             NoWork,
         }
 
-        let fd = match work {
-            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+        let fd = match work.kind {
+            ClientWorkKind::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
                 raw_fd: file.into_raw_fd(),
                 validate,
             },
-            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+            ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
-            ClientWork::NoWork {} => ClientWorkFd::NoWork,
+            ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -1015,6 +1073,10 @@ impl EngineTokioSpawnBlocking {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
@@ -1146,17 +1208,17 @@ impl EngineTokioFlume {
             NoWork,
         }
 
-        let fd = match work {
-            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+        let fd = match work.kind {
+            ClientWorkKind::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
                 raw_fd: file.into_raw_fd(),
                 validate,
             },
-            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+            ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
-            ClientWork::NoWork {} => ClientWorkFd::NoWork,
+            ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -1175,6 +1237,10 @@ impl EngineTokioFlume {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
@@ -1443,17 +1509,17 @@ impl EngineTokioRio {
             NoWork,
         }
 
-        let fd = match work {
-            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+        let fd = match work.kind {
+            ClientWorkKind::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
                 raw_fd: file.into_raw_fd(),
                 validate,
             },
-            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+            ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
-            ClientWork::NoWork {} => ClientWorkFd::NoWork,
+            ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -1472,6 +1538,10 @@ impl EngineTokioRio {
         };
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
@@ -1613,12 +1683,13 @@ impl Engine for EngineTokioEpollUring {
                 let stop_clients = Arc::clone(&stop);
                 let stop_stopped_task_status_task = Arc::clone(&stop_stopped_task_status_task);
                 async move {
-                    // don't print until `stop` is set
-                    while !stop_clients.load(Ordering::Relaxed) {
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                        debug!("waiting for clients to stop");
-                    }
-                    while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
+                    'outer: while !stop_stopped_task_status_task.load(Ordering::Relaxed) {
+                        // don't print until `stop` is set
+                        while !stop_clients.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                            debug!("waiting for clients to stop");
+                            continue 'outer;
+                        }
                         // log list of not-stopped clients every second
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let stopped = stopped_handles
@@ -1673,17 +1744,17 @@ impl EngineTokioEpollUring {
             NoWork,
         }
 
-        let fd = match work {
-            ClientWork::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
+        let fd = match work.kind {
+            ClientWorkKind::DiskAccess { file, validate } => ClientWorkFd::DiskAccess {
                 raw_fd: file.into_raw_fd(),
                 validate,
             },
-            ClientWork::TimerFdSetStateAndRead { timerfd, duration } => {
+            ClientWorkKind::TimerFdSetStateAndRead { timerfd, duration } => {
                 let ret = ClientWorkFd::TimerFd(timerfd.as_raw_fd(), duration);
                 std::mem::forget(timerfd); // they don't support into_raw_fd
                 ret
             }
-            ClientWork::NoWork {} => ClientWorkFd::NoWork,
+            ClientWorkKind::NoWork {} => ClientWorkFd::NoWork,
         };
 
         // alloc aligned to make O_DIRECT work
@@ -1703,6 +1774,10 @@ impl EngineTokioEpollUring {
 
         let block_size_u64: u64 = block_size.try_into().unwrap();
         while !stop.load(Ordering::Relaxed) {
+            let ControlFlow::Continue(()) = work.ops_left.take_one_op() else {
+                break;
+            };
+
             // simulate Timeline::layers.read().await
             let _guard = rwlock.read().await;
 
