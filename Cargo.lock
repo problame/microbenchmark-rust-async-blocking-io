@@ -226,6 +226,7 @@ dependencies = [
  "timerfd",
  "tokio",
  "tokio-epoll-uring",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -22,6 +22,7 @@ use crossbeam_utils::CachePadded;
 use itertools::Itertools;
 use rand::{Rng, RngCore};
 use serde_with::serde_as;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 #[derive(serde::Serialize, clap::Parser, Clone)]
@@ -239,7 +240,7 @@ fn main() {
     let args: Arc<Args> = Arc::new(Args::parse());
 
     let stop_engine = Arc::new(AtomicBool::new(false));
-    let engine_stopped = Arc::new(AtomicBool::new(false));
+    let stop_monitor = CancellationToken::new();
 
     let works = setup_client_works(&args);
 
@@ -291,7 +292,6 @@ fn main() {
     let monitor = std::thread::Builder::new()
         .name("monitor".to_owned())
         .spawn({
-            let engine_stopped = Arc::clone(&engine_stopped);
             let stats_state = Arc::clone(&stats_state);
             let args = Arc::clone(&args);
             let clients_and_monitor_ready = Arc::clone(&clients_and_monitor_ready);
@@ -397,6 +397,7 @@ fn main() {
                 totals: Vec<AggregatedStatsSummary>,
             }
 
+            let stop_monitor = stop_monitor.clone();
             move || {
                 let mut per_task_total_reads = HashMap::new();
                 let op_size = 1 << args.block_size_shift.get();
@@ -404,13 +405,28 @@ fn main() {
                 let mut total_summaries = Vec::new();
                 let mut this_round = AggregatedStats::new(op_size);
 
-                tokio::runtime::Builder::new_current_thread()
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
                     .build()
-                    .unwrap()
-                    .block_on(clients_and_monitor_ready.wait());
-                while !engine_stopped.load(Ordering::Relaxed) {
+                    .unwrap();
+
+                rt.block_on(clients_and_monitor_ready.wait());
+
+                let mut ticker = rt.block_on(async move { tokio::time::interval(MONITOR_PERIOD) });
+
+                let mut exit = false;
+                while !exit {
                     this_round.reset(std::time::Instant::now());
-                    std::thread::sleep(MONITOR_PERIOD);
+                    rt.block_on(async {
+                        let ticker = &mut ticker;
+                        tokio::select! {
+                            _ = ticker.tick() => {}
+                            _ = stop_monitor.cancelled() => {
+                                exit = true;
+                            }
+                        };
+                    });
+
                     for (client, counter) in stats_state.reads_in_last_second.iter().enumerate() {
                         let task_reads_in_last_second = counter.swap(0, Ordering::Relaxed);
                         let per_task = per_task_total_reads.entry(client).or_insert(0);
@@ -485,7 +501,7 @@ fn main() {
         stop_engine,
         stats_state,
     );
-    engine_stopped.store(true, Ordering::Relaxed);
+    stop_monitor.cancel();
     monitor.join().unwrap();
 }
 
